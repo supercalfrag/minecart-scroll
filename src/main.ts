@@ -6,7 +6,6 @@ const FLOOR_Z_GAP = 100000;
 const TRACK_Z_GAP = 100000;
 const FOREGROUND_Z_GAP = 200000;
 const INTERACTION_RENEW_MS = 20000;
-const MINECART_UPDATE_INTERVAL_MS = 50;
 const MINECART_DROP_SETTLE_MS = 250;
 
 type RunState = "stopped" | "running" | "paused";
@@ -31,9 +30,6 @@ type MinecartRattleState = {
   frequencyB: number;
   amplitudeScale: number;
   offsetY: number;
-  lastWrittenX: number;
-  lastWrittenY: number;
-  recentWrites: Array<{ x: number; y: number }>;
 };
 
 type MinecartRattleGroup = {
@@ -310,15 +306,19 @@ OBR.onReady(async () => {
   let activeBackground: LoopLayer | null = null;
   let activeForeground: LoopLayer | null = null;
   let activeMinecarts: MinecartRattleGroup | null = null;
-  let selectedItemIds = new Set<string>();
-  const minecartSuspended = new Set<string>();
-  const minecartSettleTimers = new Map<string, number>();
-  let minecartWriteInFlight = false;
-  let lastMinecartWriteTime = 0;
 
   type InteractionManager = Awaited<ReturnType<typeof OBR.interaction.startItemInteraction>>;
   let interactionUpdate: InteractionManager[0] | null = null;
   let interactionStop: InteractionManager[1] | null = null;
+  let minecartInteractionUpdate: InteractionManager[0] | null = null;
+  let minecartInteractionStop: InteractionManager[1] | null = null;
+
+  let selectedItemIds = new Set<string>();
+  let draggedMinecartId: string | null = null;
+  let minecartRattleSuspended = false;
+  let minecartDropTimer = 0;
+  let lastObservedMinecartX = 0;
+  let lastObservedMinecartY = 0;
 
   let animationFrame = 0;
   let renewTimer = 0;
@@ -670,9 +670,6 @@ OBR.onReady(async () => {
         frequencyB: 7 + seededUnit(`${image.id}:freqB`) * 4,
         amplitudeScale: 0.75 + seededUnit(`${image.id}:amp`) * 0.5,
         offsetY: 0,
-        lastWrittenX: image.position.x,
-        lastWrittenY: image.position.y,
-        recentWrites: [],
       });
     }
     return { images, states };
@@ -785,8 +782,6 @@ OBR.onReady(async () => {
   }
 
   function getActiveImages(): Image[] {
-    // Minecarts deliberately stay out of the long-running interaction so Owlbear
-    // can keep them draggable while the chase is running.
     return getActiveLayers().flatMap((layer) => layer.images);
   }
 
@@ -797,10 +792,10 @@ OBR.onReady(async () => {
     return null;
   }
 
-  async function commitPositions(waitForZQueue = true): Promise<void> {
+  async function commitPositions(): Promise<void> {
     const layers = getActiveLayers();
-    if (layers.length === 0 && !activeMinecarts) return;
-    if (waitForZQueue) await Promise.all(layers.map((layer) => layer.zQueue));
+    if (layers.length === 0) return;
+    await Promise.all(layers.map((layer) => layer.zQueue));
     const images = getActiveImages();
 
     await OBR.scene.items.updateItems(images, (items) => {
@@ -813,16 +808,11 @@ OBR.onReady(async () => {
           continue;
         }
 
-
       }
     });
   }
 
   async function resetMinecarts(): Promise<void> {
-    for (const timer of minecartSettleTimers.values()) window.clearTimeout(timer);
-    minecartSettleTimers.clear();
-    minecartSuspended.clear();
-
     if (!activeMinecarts) return;
     const images = activeMinecarts.images;
     const states = activeMinecarts.states;
@@ -831,80 +821,99 @@ OBR.onReady(async () => {
         const cart = states.get(item.id);
         if (!cart) continue;
         cart.offsetY = 0;
-        cart.lastWrittenX = cart.baseX;
-        cart.lastWrittenY = cart.baseY;
-        cart.recentWrites.push({ x: cart.baseX, y: cart.baseY });
-        if (cart.recentWrites.length > 40) cart.recentWrites.splice(0, cart.recentWrites.length - 40);
         item.position.x = cart.baseX;
         item.position.y = cart.baseY;
       }
     });
   }
 
-  selectedItemIds = new Set((await OBR.player.getSelection()) ?? []);
+  function clearMinecartDropTimer(): void {
+    if (minecartDropTimer) window.clearTimeout(minecartDropTimer);
+    minecartDropTimer = 0;
+  }
 
-  function suspendMinecart(id: string): void {
-    if (!activeMinecarts?.states.has(id)) return;
-    minecartSuspended.add(id);
+  function closeMinecartInteraction(): void {
+    const stop = minecartInteractionStop;
+    minecartInteractionUpdate = null;
+    minecartInteractionStop = null;
 
-    const existing = minecartSettleTimers.get(id);
-    if (existing !== undefined) {
-      window.clearTimeout(existing);
-      minecartSettleTimers.delete(id);
+    if (stop) {
+      try {
+        stop();
+      } catch (error) {
+        console.error("Could not stop minecart rattle interaction:", error);
+      }
+    }
+  }
+
+  async function openMinecartInteraction(): Promise<void> {
+    closeMinecartInteraction();
+    if (!activeMinecarts || minecartRattleSuspended || runState !== "running") return;
+
+    const ids = activeMinecarts.images.map((image) => image.id);
+    if (ids.length === 0) return;
+    const refreshed = await OBR.scene.items.getItems(ids);
+    const refreshedImages = refreshed.filter(isImage);
+    if (refreshedImages.length !== ids.length) throw new Error("One or more minecart images disappeared from the scene.");
+
+    const interaction = await OBR.interaction.startItemInteraction(refreshedImages);
+    minecartInteractionUpdate = interaction[0];
+    minecartInteractionStop = interaction[1];
+  }
+
+  async function captureDroppedMinecart(id: string): Promise<void> {
+    clearMinecartDropTimer();
+    if (!activeMinecarts || draggedMinecartId !== id) return;
+
+    try {
+      const items = await OBR.scene.items.getItems([id]);
+      const item = items.find((candidate) => candidate.id === id);
+      const cart = activeMinecarts.states.get(id);
+      if (!item || !cart || !isImage(item)) return;
+
+      cart.baseX = item.position.x;
+      cart.baseY = item.position.y;
+      cart.offsetY = 0;
+      lastObservedMinecartX = item.position.x;
+      lastObservedMinecartY = item.position.y;
+      draggedMinecartId = null;
+      minecartRattleSuspended = false;
+
+      if (runState === "running" && !renewing) await openMinecartInteraction();
+    } catch (error) {
+      console.error("Could not capture dropped minecart:", error);
     }
   }
 
   function scheduleMinecartDropCapture(id: string): void {
-    if (!activeMinecarts?.states.has(id)) return;
-
-    suspendMinecart(id);
-
-    const timer = window.setTimeout(() => {
-      minecartSettleTimers.delete(id);
-
-      void OBR.scene.items
-        .getItems([id])
-        .then((items) => {
-          if (!activeMinecarts) return;
-          const item = items.find((candidate) => candidate.id === id);
-          const cart = activeMinecarts.states.get(id);
-          if (!item || !cart || !isImage(item)) return;
-
-          // No external movement has arrived for the settle window, so treat
-          // this as the dropped position and resume rattle from here.
-          cart.baseX = item.position.x;
-          cart.baseY = item.position.y;
-          cart.offsetY = 0;
-          cart.lastWrittenX = item.position.x;
-          cart.lastWrittenY = item.position.y;
-          minecartSuspended.delete(id);
-        })
-        .catch((error) => {
-          console.error("Minecart drop capture failed:", error);
-          minecartSuspended.delete(id);
-        });
+    clearMinecartDropTimer();
+    minecartDropTimer = window.setTimeout(() => {
+      void captureDroppedMinecart(id);
     }, MINECART_DROP_SETTLE_MS);
-
-    minecartSettleTimers.set(id, timer);
   }
+
+  selectedItemIds = new Set((await OBR.player.getSelection()) ?? []);
 
   OBR.player.onChange((player) => {
     const nextSelection = new Set<string>(player.selection ?? []);
 
-    if (activeMinecarts) {
+    if (activeMinecarts && runState === "running") {
       for (const id of nextSelection) {
         if (!selectedItemIds.has(id) && activeMinecarts.states.has(id)) {
-          // Picking up/selecting a cart suspends rattle immediately.
-          suspendMinecart(id);
+          draggedMinecartId = id;
+          minecartRattleSuspended = true;
+          clearMinecartDropTimer();
+          closeMinecartInteraction();
+
+          const cart = activeMinecarts.states.get(id)!;
+          lastObservedMinecartX = cart.baseX;
+          lastObservedMinecartY = cart.baseY;
+          break;
         }
       }
 
-      for (const id of selectedItemIds) {
-        if (!nextSelection.has(id) && activeMinecarts.states.has(id)) {
-          // If Owlbear clears selection on drop, use that as an additional
-          // signal to begin the settle window.
-          scheduleMinecartDropCapture(id);
-        }
+      if (draggedMinecartId && selectedItemIds.has(draggedMinecartId) && !nextSelection.has(draggedMinecartId)) {
+        scheduleMinecartDropCapture(draggedMinecartId);
       }
     }
 
@@ -912,77 +921,29 @@ OBR.onReady(async () => {
   });
 
   OBR.scene.items.onChange((items) => {
-    if (!activeMinecarts) return;
+    if (!activeMinecarts || !minecartRattleSuspended || !draggedMinecartId) return;
 
-    for (const item of items) {
-      const cart = activeMinecarts.states.get(item.id);
-      if (!cart || !isImage(item)) continue;
+    const item = items.find((candidate) => candidate.id === draggedMinecartId);
+    if (!item || !isImage(item)) return;
 
-      // Owlbear's scene change event can arrive after one or more newer rattle
-      // writes have already been queued. Keep a short history of our own targets
-      // so delayed self-updates are never mistaken for a player drag.
-      const recentWriteIndex = cart.recentWrites.findIndex(
-        (write) =>
-          Math.abs(item.position.x - write.x) < 0.01 &&
-          Math.abs(item.position.y - write.y) < 0.01,
-      );
-      if (recentWriteIndex >= 0) {
-        cart.recentWrites.splice(recentWriteIndex, 1);
-        continue;
-      }
+    const moved =
+      Math.abs(item.position.x - lastObservedMinecartX) >= 0.01 ||
+      Math.abs(item.position.y - lastObservedMinecartY) >= 0.01;
+    if (!moved) return;
 
-      const matchesLastWrite =
-        Math.abs(item.position.x - cart.lastWrittenX) < 0.01 &&
-        Math.abs(item.position.y - cart.lastWrittenY) < 0.01;
-      if (matchesLastWrite) continue;
+    const cart = activeMinecarts.states.get(draggedMinecartId);
+    if (!cart) return;
 
-      // This was an external move (normally a drag). Stop all rattle writes,
-      // remember the latest position, and restart the drop timer. Every new
-      // drag update extends the timer, so rattle cannot resume mid-drag.
-      cart.recentWrites.length = 0;
-      cart.baseX = item.position.x;
-      cart.baseY = item.position.y;
-      cart.offsetY = 0;
-      cart.lastWrittenX = item.position.x;
-      cart.lastWrittenY = item.position.y;
-      scheduleMinecartDropCapture(item.id);
-    }
+    // The rattle interaction is fully stopped while dragging, so any movement
+    // here belongs to Owlbear's normal pointer drag. Keep the newest resting
+    // point and wait briefly for movement to stop before restarting rattle.
+    cart.baseX = item.position.x;
+    cart.baseY = item.position.y;
+    cart.offsetY = 0;
+    lastObservedMinecartX = item.position.x;
+    lastObservedMinecartY = item.position.y;
+    scheduleMinecartDropCapture(draggedMinecartId);
   });
-
-  function pushMinecartRattle(timeMs: number): void {
-    if (!activeMinecarts || minecartWriteInFlight) return;
-    if (timeMs - lastMinecartWriteTime < MINECART_UPDATE_INTERVAL_MS) return;
-
-    lastMinecartWriteTime = timeMs;
-    minecartWriteInFlight = true;
-    const images = activeMinecarts.images;
-    const states = activeMinecarts.states;
-
-    void OBR.scene.items
-      .updateItems(images, (items) => {
-        for (const item of items) {
-          const cart = states.get(item.id);
-          if (!cart) continue;
-
-          // A suspended cart is being picked up, dragged, or settling after a drop.
-          // Minecart Scroll writes absolutely nothing to it until the settle timer ends.
-          if (minecartSuspended.has(item.id)) continue;
-
-          const x = cart.baseX;
-          const y = cart.baseY + cart.offsetY;
-          cart.lastWrittenX = x;
-          cart.lastWrittenY = y;
-          cart.recentWrites.push({ x, y });
-          if (cart.recentWrites.length > 40) cart.recentWrites.splice(0, cart.recentWrites.length - 40);
-          item.position.x = x;
-          item.position.y = y;
-        }
-      })
-      .catch((error) => console.error("Minecart rattle update failed:", error))
-      .finally(() => {
-        minecartWriteInFlight = false;
-      });
-  }
 
   function closeInteraction(): void {
     const stop = interactionStop;
@@ -1023,6 +984,8 @@ OBR.onReady(async () => {
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
     closeInteraction();
+    closeMinecartInteraction();
+    clearMinecartDropTimer();
   }
 
   async function pauseForHiddenPanel(): Promise<void> {
@@ -1038,6 +1001,8 @@ OBR.onReady(async () => {
       console.error("Could not commit positions while panel was hidden:", error);
     } finally {
       closeInteraction();
+      closeMinecartInteraction();
+      await resetMinecarts();
       currentSpeed = 0;
       currentSpeedValue.textContent = "0";
       runState = "paused";
@@ -1061,13 +1026,12 @@ OBR.onReady(async () => {
     updateRunButtons();
     try {
       cancelAnimationFrame(animationFrame);
-      // Renewal only needs the current positions committed. Do not wait for the
-      // z-index recycle queue here: at high speeds that queue can be long enough
-      // to make the chase appear frozen while renewal waits for it to drain.
-      await commitPositions(false);
+      await commitPositions();
       closeInteraction();
+      closeMinecartInteraction();
       if (runState === "running") {
         await openInteraction();
+        if (!minecartRattleSuspended) await openMinecartInteraction();
         lastTime = performance.now();
         animationFrame = requestAnimationFrame(animate);
         scheduleRenewal();
@@ -1075,6 +1039,7 @@ OBR.onReady(async () => {
     } catch (error) {
       console.error("Interaction renewal failed:", error);
       closeInteraction();
+      closeMinecartInteraction();
       currentSpeed = 0;
       currentSpeedValue.textContent = "0";
       runState = "paused";
@@ -1124,7 +1089,6 @@ OBR.onReady(async () => {
     if (activeBackground) moveLayer(activeBackground, deltaTime, backgroundMultiplier);
     if (activeForeground) moveLayer(activeForeground, deltaTime, foregroundMultiplier);
     updateMinecartRattle(time / 1000);
-    pushMinecartRattle(time);
 
     if (interactionUpdate) {
       interactionUpdate((draft) => {
@@ -1136,10 +1100,19 @@ OBR.onReady(async () => {
             const x = layer.positions.get(item.id);
             if (x !== undefined) item.position.x = x;
             item.position.y = layer.y;
-            continue;
           }
+        }
+      });
+    }
 
-
+    if (minecartInteractionUpdate && activeMinecarts && !minecartRattleSuspended) {
+      minecartInteractionUpdate((draft) => {
+        const items = Array.isArray(draft) ? draft : [draft];
+        for (const item of items) {
+          const cart = activeMinecarts?.states.get(item.id);
+          if (!cart) continue;
+          item.position.x = cart.baseX;
+          item.position.y = cart.baseY + cart.offsetY;
         }
       });
     }
@@ -1212,8 +1185,6 @@ OBR.onReady(async () => {
     }
 
     activeMinecarts = prepareMinecarts(minecartImages);
-    minecartWriteInFlight = false;
-    lastMinecartWriteTime = 0;
   }
 
   startButton.addEventListener("click", async () => {
@@ -1229,8 +1200,9 @@ OBR.onReady(async () => {
       if (focusOnStartCheckbox.checked) await goToAnchor();
       currentSpeed = 0;
       currentSpeedValue.textContent = "0";
-      await openInteraction();
       runState = "running";
+      await openInteraction();
+      await openMinecartInteraction();
       lastTime = performance.now();
       animationFrame = requestAnimationFrame(animate);
       scheduleRenewal();
@@ -1243,6 +1215,10 @@ OBR.onReady(async () => {
       activeTrack = null;
       activeBackground = null;
       activeForeground = null;
+      closeMinecartInteraction();
+      clearMinecartDropTimer();
+      draggedMinecartId = null;
+      minecartRattleSuspended = false;
       activeMinecarts = null;
       runState = "stopped";
       updateRunButtons();
@@ -1255,6 +1231,8 @@ OBR.onReady(async () => {
     cancelAnimationFrame(animationFrame);
     await commitPositions();
     closeInteraction();
+    closeMinecartInteraction();
+    await resetMinecarts();
     currentSpeed = 0;
     currentSpeedValue.textContent = "0";
     runState = "paused";
@@ -1267,8 +1245,9 @@ OBR.onReady(async () => {
     try {
       currentSpeed = 0;
       currentSpeedValue.textContent = "0";
-      await openInteraction();
       runState = "running";
+      await openInteraction();
+      await openMinecartInteraction();
       lastTime = performance.now();
       animationFrame = requestAnimationFrame(animate);
       scheduleRenewal();
@@ -1287,6 +1266,10 @@ OBR.onReady(async () => {
 
     if (runState === "running") await commitPositions();
     closeInteraction();
+    closeMinecartInteraction();
+    clearMinecartDropTimer();
+    draggedMinecartId = null;
+    minecartRattleSuspended = false;
     await resetMinecarts();
 
     currentSpeed = 0;
@@ -1306,6 +1289,10 @@ OBR.onReady(async () => {
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
     closeInteraction();
+    closeMinecartInteraction();
+    clearMinecartDropTimer();
+    draggedMinecartId = null;
+    minecartRattleSuspended = false;
     await resetMinecarts();
     renewing = false;
     currentSpeed = 0;
