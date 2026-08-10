@@ -33,6 +33,7 @@ type MinecartRattleState = {
   offsetY: number;
   lastWrittenX: number;
   lastWrittenY: number;
+  recentWrites: Array<{ x: number; y: number }>;
 };
 
 type MinecartRattleGroup = {
@@ -671,6 +672,7 @@ OBR.onReady(async () => {
         offsetY: 0,
         lastWrittenX: image.position.x,
         lastWrittenY: image.position.y,
+        recentWrites: [],
       });
     }
     return { images, states };
@@ -795,10 +797,10 @@ OBR.onReady(async () => {
     return null;
   }
 
-  async function commitPositions(): Promise<void> {
+  async function commitPositions(waitForZQueue = true): Promise<void> {
     const layers = getActiveLayers();
     if (layers.length === 0 && !activeMinecarts) return;
-    await Promise.all(layers.map((layer) => layer.zQueue));
+    if (waitForZQueue) await Promise.all(layers.map((layer) => layer.zQueue));
     const images = getActiveImages();
 
     await OBR.scene.items.updateItems(images, (items) => {
@@ -831,6 +833,8 @@ OBR.onReady(async () => {
         cart.offsetY = 0;
         cart.lastWrittenX = cart.baseX;
         cart.lastWrittenY = cart.baseY;
+        cart.recentWrites.push({ x: cart.baseX, y: cart.baseY });
+        if (cart.recentWrites.length > 40) cart.recentWrites.splice(0, cart.recentWrites.length - 40);
         item.position.x = cart.baseX;
         item.position.y = cart.baseY;
       }
@@ -914,6 +918,19 @@ OBR.onReady(async () => {
       const cart = activeMinecarts.states.get(item.id);
       if (!cart || !isImage(item)) continue;
 
+      // Owlbear's scene change event can arrive after one or more newer rattle
+      // writes have already been queued. Keep a short history of our own targets
+      // so delayed self-updates are never mistaken for a player drag.
+      const recentWriteIndex = cart.recentWrites.findIndex(
+        (write) =>
+          Math.abs(item.position.x - write.x) < 0.01 &&
+          Math.abs(item.position.y - write.y) < 0.01,
+      );
+      if (recentWriteIndex >= 0) {
+        cart.recentWrites.splice(recentWriteIndex, 1);
+        continue;
+      }
+
       const matchesLastWrite =
         Math.abs(item.position.x - cart.lastWrittenX) < 0.01 &&
         Math.abs(item.position.y - cart.lastWrittenY) < 0.01;
@@ -922,6 +939,7 @@ OBR.onReady(async () => {
       // This was an external move (normally a drag). Stop all rattle writes,
       // remember the latest position, and restart the drop timer. Every new
       // drag update extends the timer, so rattle cannot resume mid-drag.
+      cart.recentWrites.length = 0;
       cart.baseX = item.position.x;
       cart.baseY = item.position.y;
       cart.offsetY = 0;
@@ -954,6 +972,8 @@ OBR.onReady(async () => {
           const y = cart.baseY + cart.offsetY;
           cart.lastWrittenX = x;
           cart.lastWrittenY = y;
+          cart.recentWrites.push({ x, y });
+          if (cart.recentWrites.length > 40) cart.recentWrites.splice(0, cart.recentWrites.length - 40);
           item.position.x = x;
           item.position.y = y;
         }
@@ -1041,7 +1061,10 @@ OBR.onReady(async () => {
     updateRunButtons();
     try {
       cancelAnimationFrame(animationFrame);
-      await commitPositions();
+      // Renewal only needs the current positions committed. Do not wait for the
+      // z-index recycle queue here: at high speeds that queue can be long enough
+      // to make the chase appear frozen while renewal waits for it to drain.
+      await commitPositions(false);
       closeInteraction();
       if (runState === "running") {
         await openInteraction();
