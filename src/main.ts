@@ -265,7 +265,7 @@ async function arrangeSourceLayer(
       item.position.y = startY;
       item.zIndex = zBase + index;
       item.disableAutoZIndex = true;
-      item.visible = false;
+      // Source items deliberately remain visible. Local scrolling copies render on top.
     }
   });
 
@@ -301,14 +301,8 @@ async function prepareSources(settings: SavedSettings): Promise<void> {
     backgroundOverride,
   );
 
-  // Temporarily reveal the first prepared background only while measuring its actual centered bounds.
-  await OBR.scene.items.updateItems([preparedBackground[0]], (items) => {
-    if (items[0]) items[0].visible = true;
-  });
+  // Source items are never hidden; measure the prepared background directly.
   const currentBackgroundBounds = await OBR.scene.items.getItemBounds([preparedBackground[0].id]);
-  await OBR.scene.items.updateItems([preparedBackground[0]], (items) => {
-    if (items[0]) items[0].visible = false;
-  });
 
   const sortedTrack = [...track].sort((a, b) => a.position.x - b.position.x);
   const firstTrack = sortedTrack[0];
@@ -398,6 +392,7 @@ async function runControllerBackground(): Promise<void> {
         if (command.type === "START") {
           const settings = parseSavedSettings(command.settings);
           if (!settings) throw new Error("Invalid chase settings.");
+          await ensureAssignedSourcesVisible();
           await prepareSources(settings);
           const revision = (current?.revision ?? 0) + 1;
           const now = Date.now();
@@ -581,6 +576,15 @@ async function runLocalRendererBackground(): Promise<void> {
       if (track) layers.push(track);
       if (foreground) layers.push(foreground);
       localLayers = layers;
+
+      if (layers.length === 0) {
+        throw new Error("No scrolling layers could be created from the assigned images.");
+      }
+    } catch (error) {
+      localLayers = [];
+      const message = error instanceof Error ? error.message : "Unknown local renderer error.";
+      console.error("Minecart Scroll renderer failed:", error);
+      await sendStatus(false, `Renderer failed: ${message}`);
     } finally {
       syncing = false;
     }
@@ -1051,42 +1055,36 @@ async function runUI(): Promise<void> {
 }
 
 
-async function recoverBrokenV4Runtime(): Promise<void> {
-  // Always clear any temporary local clones left by a failed renderer on this client.
+async function ensureAssignedSourcesVisible(): Promise<void> {
+  // Minecart Scroll never hides scene source items anymore. This also repairs items
+  // left hidden by older v0.4 builds, including Floor and Minecart assignments.
   await cleanupLocalClones();
 
   if (!(await OBR.scene.isReady())) return;
 
-  const role = await OBR.player.getRole();
-  if (role !== "GM") return;
-
   const metadata = await OBR.scene.getMetadata();
-  const rawRuntime = metadata[RUNTIME_KEY];
-  if (!rawRuntime || typeof rawRuntime !== "object") return;
-
-  const runtimeRecord = rawRuntime as Record<string, unknown>;
-  if (runtimeRecord.version !== 4) return;
-
   const ids = new Set<string>();
-  for (const key of ["floorIds", "backgroundIds", "trackIds", "minecartIds", "foregroundIds"]) {
-    const value = runtimeRecord[key];
-    if (!Array.isArray(value)) continue;
-    for (const id of value) {
-      if (typeof id === "string") ids.add(id);
+  const assignmentKeys = ["floorIds", "backgroundIds", "trackIds", "minecartIds", "foregroundIds"];
+
+  for (const raw of [metadata[SETTINGS_KEY], metadata[RUNTIME_KEY]]) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    for (const key of assignmentKeys) {
+      const value = record[key];
+      if (!Array.isArray(value)) continue;
+      for (const id of value) {
+        if (typeof id === "string") ids.add(id);
+      }
     }
   }
 
-  if (ids.size > 0) {
-    const items = await OBR.scene.items.getItems([...ids]);
-    if (items.length > 0) {
-      await OBR.scene.items.updateItems(items, (draft) => {
-        for (const item of draft) item.visible = true;
-      });
-    }
-  }
+  if (ids.size === 0) return;
+  const items = await OBR.scene.items.getItems([...ids]);
+  if (items.length === 0) return;
 
-  // Clear only the broken v4 runtime. Existing saved assignments remain intact.
-  await OBR.scene.setMetadata({ [RUNTIME_KEY]: null });
+  await OBR.scene.items.updateItems(items, (draft) => {
+    for (const item of draft) item.visible = true;
+  });
 }
 
 const backgroundMode = new URLSearchParams(window.location.search).get("background") === "1";
@@ -1094,7 +1092,7 @@ const backgroundMode = new URLSearchParams(window.location.search).get("backgrou
 if (backgroundMode) {
   OBR.onReady(() => {
     void (async () => {
-      await recoverBrokenV4Runtime();
+      await ensureAssignedSourcesVisible();
       await runLocalRendererBackground();
       await runControllerBackground();
     })();
