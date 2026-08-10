@@ -2,6 +2,7 @@ import OBR, { isImage, type Image } from "@owlbear-rodeo/sdk";
 
 const SETTINGS_KEY = "com.supercalfrag.minecart-scroll/settings";
 const TRACK_OVERLAP = 2;
+const FLOOR_Z_GAP = 100000;
 const TRACK_Z_GAP = 100000;
 const FOREGROUND_Z_GAP = 200000;
 const INTERACTION_RENEW_MS = 20000;
@@ -19,21 +20,45 @@ type LoopLayer = {
   zQueue: Promise<void>;
 };
 
+type MinecartRattleState = {
+  baseX: number;
+  baseY: number;
+  phaseA: number;
+  phaseB: number;
+  frequencyA: number;
+  frequencyB: number;
+  amplitudeScale: number;
+  offsetY: number;
+};
+
+type MinecartRattleGroup = {
+  images: Image[];
+  states: Map<string, MinecartRattleState>;
+};
+
 type SavedSettings = {
-  version: 2;
+  version: 3;
+  floorIds: string[];
   trackIds: string[];
   backgroundIds: string[];
   foregroundIds: string[];
+  minecartIds: string[];
   anchorX: number;
   anchorY: number;
+  floorYOffset: number;
   trackYOffset: number;
   foregroundYOffset: number;
+  floorOverlap: number;
   backgroundOverlap: number;
   foregroundOverlap: number;
   targetSpeed: number;
   acceleration: number;
+  floorMultiplier: number;
   backgroundMultiplier: number;
   foregroundMultiplier: number;
+  rattleEnabled: boolean;
+  rattleStrength: number;
+  rattleStartSpeed: number;
   focusOnStart: boolean;
 };
 
@@ -51,14 +76,20 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <div id="gmPanel" hidden style="max-height: 540px; overflow-y: auto; padding-right: 4px;">
       <fieldset>
         <legend><strong>Layers</strong></legend>
-        <button id="setTrackButton">Set Track</button>
-        <span id="trackStatus">Not set</span><br><br>
+        <button id="setFloorButton">Set Floor</button>
+        <span id="floorStatus">Not set (optional)</span><br><br>
 
         <button id="setBackgroundButton">Set Background</button>
         <span id="backgroundStatus">Not set</span><br><br>
 
+        <button id="setTrackButton">Set Track</button>
+        <span id="trackStatus">Not set</span><br><br>
+
         <button id="setForegroundButton">Set Foreground</button>
-        <span id="foregroundStatus">Not set (optional)</span>
+        <span id="foregroundStatus">Not set (optional)</span><br><br>
+
+        <button id="setMinecartsButton">Set Minecarts</button>
+        <span id="minecartsStatus">Not set (optional)</span>
       </fieldset>
 
       <br>
@@ -95,12 +126,20 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 
       <fieldset>
         <legend><strong>Layout</strong></legend>
+        <label>Floor Y Offset:
+          <input id="floorYOffsetInput" type="number" value="0" step="10" style="width:90px;">
+        </label>
+        <br><br>
         <label>Track Y Offset:
           <input id="trackYOffsetInput" type="number" value="0" step="10" style="width:90px;">
         </label>
         <br><br>
         <label>Foreground Y Offset:
           <input id="foregroundYOffsetInput" type="number" value="0" step="10" style="width:90px;">
+        </label>
+        <br><br>
+        <label>Floor Seam Overlap:
+          <input id="floorOverlapInput" type="number" min="0" max="50" value="0" step="1" style="width:70px;">
         </label>
         <br><br>
         <label>Background Seam Overlap:
@@ -125,12 +164,33 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <input id="accelerationSlider" type="range" min="25" max="1000" value="200" step="25" style="width:100%;">
 
         <br><br>
+        <label>Floor Speed: <strong><span id="floorMultiplierValue">45</span>%</strong></label>
+        <input id="floorMultiplierSlider" type="range" min="0" max="100" value="45" step="5" style="width:100%;">
+
+        <br><br>
         <label>Background Speed: <strong><span id="backgroundMultiplierValue">40</span>%</strong></label>
         <input id="backgroundMultiplierSlider" type="range" min="0" max="100" value="40" step="5" style="width:100%;">
 
         <br><br>
         <label>Foreground Speed: <strong><span id="foregroundMultiplierValue">140</span>%</strong></label>
         <input id="foregroundMultiplierSlider" type="range" min="100" max="250" value="140" step="5" style="width:100%;">
+      </fieldset>
+
+      <br>
+
+      <fieldset>
+        <legend><strong>Minecart Rattle</strong></legend>
+        <label>
+          <input id="rattleEnabledCheckbox" type="checkbox" checked>
+          Enable independent vertical rattle
+        </label>
+        <br><br>
+        <label>Rattle Strength: <strong><span id="rattleStrengthValue">100</span>%</strong></label>
+        <input id="rattleStrengthSlider" type="range" min="0" max="200" value="100" step="10" style="width:100%;">
+        <br><br>
+        <label>Rattle Starts At Speed:
+          <input id="rattleStartSpeedInput" type="number" min="0" max="1000" value="100" step="25" style="width:80px;">
+        </label>
       </fieldset>
 
       <br>
@@ -166,13 +226,17 @@ OBR.onReady(async () => {
   gmPanel.hidden = false;
   status.textContent = "GM controls ready.";
 
+  const floorStatus = document.querySelector<HTMLSpanElement>("#floorStatus")!;
   const trackStatus = document.querySelector<HTMLSpanElement>("#trackStatus")!;
   const backgroundStatus = document.querySelector<HTMLSpanElement>("#backgroundStatus")!;
   const foregroundStatus = document.querySelector<HTMLSpanElement>("#foregroundStatus")!;
+  const minecartsStatus = document.querySelector<HTMLSpanElement>("#minecartsStatus")!;
 
+  const setFloorButton = document.querySelector<HTMLButtonElement>("#setFloorButton")!;
   const setTrackButton = document.querySelector<HTMLButtonElement>("#setTrackButton")!;
   const setBackgroundButton = document.querySelector<HTMLButtonElement>("#setBackgroundButton")!;
   const setForegroundButton = document.querySelector<HTMLButtonElement>("#setForegroundButton")!;
+  const setMinecartsButton = document.querySelector<HTMLButtonElement>("#setMinecartsButton")!;
   const saveButton = document.querySelector<HTMLButtonElement>("#saveButton")!;
   const loadButton = document.querySelector<HTMLButtonElement>("#loadButton")!;
 
@@ -181,8 +245,10 @@ OBR.onReady(async () => {
   const goToAnchorButton = document.querySelector<HTMLButtonElement>("#goToAnchorButton")!;
   const focusOnStartCheckbox = document.querySelector<HTMLInputElement>("#focusOnStartCheckbox")!;
 
+  const floorYOffsetInput = document.querySelector<HTMLInputElement>("#floorYOffsetInput")!;
   const trackYOffsetInput = document.querySelector<HTMLInputElement>("#trackYOffsetInput")!;
   const foregroundYOffsetInput = document.querySelector<HTMLInputElement>("#foregroundYOffsetInput")!;
+  const floorOverlapInput = document.querySelector<HTMLInputElement>("#floorOverlapInput")!;
   const backgroundOverlapInput = document.querySelector<HTMLInputElement>("#backgroundOverlapInput")!;
   const foregroundOverlapInput = document.querySelector<HTMLInputElement>("#foregroundOverlapInput")!;
 
@@ -191,10 +257,16 @@ OBR.onReady(async () => {
   const currentSpeedValue = document.querySelector<HTMLSpanElement>("#currentSpeedValue")!;
   const accelerationSlider = document.querySelector<HTMLInputElement>("#accelerationSlider")!;
   const accelerationValue = document.querySelector<HTMLSpanElement>("#accelerationValue")!;
+  const floorMultiplierSlider = document.querySelector<HTMLInputElement>("#floorMultiplierSlider")!;
+  const floorMultiplierValue = document.querySelector<HTMLSpanElement>("#floorMultiplierValue")!;
   const backgroundMultiplierSlider = document.querySelector<HTMLInputElement>("#backgroundMultiplierSlider")!;
   const backgroundMultiplierValue = document.querySelector<HTMLSpanElement>("#backgroundMultiplierValue")!;
   const foregroundMultiplierSlider = document.querySelector<HTMLInputElement>("#foregroundMultiplierSlider")!;
   const foregroundMultiplierValue = document.querySelector<HTMLSpanElement>("#foregroundMultiplierValue")!;
+  const rattleEnabledCheckbox = document.querySelector<HTMLInputElement>("#rattleEnabledCheckbox")!;
+  const rattleStrengthSlider = document.querySelector<HTMLInputElement>("#rattleStrengthSlider")!;
+  const rattleStrengthValue = document.querySelector<HTMLSpanElement>("#rattleStrengthValue")!;
+  const rattleStartSpeedInput = document.querySelector<HTMLInputElement>("#rattleStartSpeedInput")!;
 
   const startButton = document.querySelector<HTMLButtonElement>("#startButton")!;
   const pauseButton = document.querySelector<HTMLButtonElement>("#pauseButton")!;
@@ -202,27 +274,37 @@ OBR.onReady(async () => {
   const stopButton = document.querySelector<HTMLButtonElement>("#stopButton")!;
   const emergencyResetButton = document.querySelector<HTMLButtonElement>("#emergencyResetButton")!;
 
+  let floorIds: string[] = [];
   let trackIds: string[] = [];
   let backgroundIds: string[] = [];
   let foregroundIds: string[] = [];
+  let minecartIds: string[] = [];
 
   let anchorX = 0;
   let anchorY = 0;
+  let floorYOffset = 0;
   let trackYOffset = 0;
   let foregroundYOffset = 0;
+  let floorOverlap = 0;
   let backgroundOverlap = 0;
   let foregroundOverlap = 0;
 
   let targetSpeed = 150;
   let currentSpeed = 0;
   let acceleration = 200;
+  let floorMultiplier = 0.45;
   let backgroundMultiplier = 0.4;
   let foregroundMultiplier = 1.4;
+  let rattleEnabled = true;
+  let rattleStrength = 1;
+  let rattleStartSpeed = 100;
 
   let runState: RunState = "stopped";
+  let activeFloor: LoopLayer | null = null;
   let activeTrack: LoopLayer | null = null;
   let activeBackground: LoopLayer | null = null;
   let activeForeground: LoopLayer | null = null;
+  let activeMinecarts: MinecartRattleGroup | null = null;
 
   type InteractionManager = Awaited<ReturnType<typeof OBR.interaction.startItemInteraction>>;
   let interactionUpdate: InteractionManager[0] | null = null;
@@ -241,16 +323,23 @@ OBR.onReady(async () => {
   function readControls(): void {
     anchorX = Number.isFinite(Number(anchorXInput.value)) ? Number(anchorXInput.value) : 0;
     anchorY = Number.isFinite(Number(anchorYInput.value)) ? Number(anchorYInput.value) : 0;
+    floorYOffset = clampNumber(Number(floorYOffsetInput.value), -10000, 10000, 0);
     trackYOffset = clampNumber(Number(trackYOffsetInput.value), -10000, 10000, 0);
     foregroundYOffset = clampNumber(Number(foregroundYOffsetInput.value), -10000, 10000, 0);
+    floorOverlap = clampNumber(Number(floorOverlapInput.value), 0, 50, 0);
     backgroundOverlap = clampNumber(Number(backgroundOverlapInput.value), 0, 50, 0);
     foregroundOverlap = clampNumber(Number(foregroundOverlapInput.value), 0, 50, 0);
+    rattleEnabled = rattleEnabledCheckbox.checked;
+    rattleStrength = clampNumber(Number(rattleStrengthSlider.value), 0, 200, 100) / 100;
+    rattleStartSpeed = clampNumber(Number(rattleStartSpeedInput.value), 0, 1000, 100);
   }
 
   function updateLayerLabels(): void {
+    floorStatus.textContent = floorIds.length >= 2 ? `${floorIds.length} images` : "Not set (optional)";
     trackStatus.textContent = trackIds.length >= 2 ? `${trackIds.length} images` : "Not set";
     backgroundStatus.textContent = backgroundIds.length >= 2 ? `${backgroundIds.length} images` : "Not set";
     foregroundStatus.textContent = foregroundIds.length >= 2 ? `${foregroundIds.length} images` : "Not set (optional)";
+    minecartsStatus.textContent = minecartIds.length >= 1 ? `${minecartIds.length} images` : "Not set (optional)";
   }
 
   function updateRunButtons(): void {
@@ -258,9 +347,11 @@ OBR.onReady(async () => {
     pauseButton.disabled = runState !== "running" || renewing;
     resumeButton.disabled = runState !== "paused" || renewing;
     stopButton.disabled = runState === "stopped" || renewing;
+    setFloorButton.disabled = runState !== "stopped";
     setTrackButton.disabled = runState !== "stopped";
     setBackgroundButton.disabled = runState !== "stopped";
     setForegroundButton.disabled = runState !== "stopped";
+    setMinecartsButton.disabled = runState !== "stopped";
     loadButton.disabled = runState !== "stopped";
   }
 
@@ -274,6 +365,13 @@ OBR.onReady(async () => {
     acceleration = clampNumber(value, 25, 1000, 200);
     accelerationSlider.value = String(acceleration);
     accelerationValue.textContent = String(Math.round(acceleration));
+  }
+
+  function applyFloorMultiplier(percent: number): void {
+    const value = clampNumber(percent, 0, 100, 45);
+    floorMultiplier = value / 100;
+    floorMultiplierSlider.value = String(value);
+    floorMultiplierValue.textContent = String(Math.round(value));
   }
 
   function applyBackgroundMultiplier(percent: number): void {
@@ -292,8 +390,21 @@ OBR.onReady(async () => {
 
   targetSpeedSlider.addEventListener("input", () => applyTargetSpeed(Number(targetSpeedSlider.value)));
   accelerationSlider.addEventListener("input", () => applyAcceleration(Number(accelerationSlider.value)));
+  floorMultiplierSlider.addEventListener("input", () => applyFloorMultiplier(Number(floorMultiplierSlider.value)));
   backgroundMultiplierSlider.addEventListener("input", () => applyBackgroundMultiplier(Number(backgroundMultiplierSlider.value)));
   foregroundMultiplierSlider.addEventListener("input", () => applyForegroundMultiplier(Number(foregroundMultiplierSlider.value)));
+  rattleEnabledCheckbox.addEventListener("change", readControls);
+  rattleStrengthSlider.addEventListener("input", () => {
+    rattleStrengthValue.textContent = rattleStrengthSlider.value;
+    readControls();
+  });
+  rattleStartSpeedInput.addEventListener("change", readControls);
+
+  floorYOffsetInput.addEventListener("change", () => {
+    const oldValue = floorYOffset;
+    readControls();
+    if (activeFloor) activeFloor.y += floorYOffset - oldValue;
+  });
 
   trackYOffsetInput.addEventListener("change", () => {
     const oldValue = trackYOffset;
@@ -307,10 +418,10 @@ OBR.onReady(async () => {
     if (activeForeground) activeForeground.y += foregroundYOffset - oldValue;
   });
 
-  async function getSelectedImages(): Promise<Image[] | null> {
+  async function getSelectedImages(minimum: number): Promise<Image[] | null> {
     const selection = await OBR.player.getSelection();
-    if (!selection || selection.length < 2) {
-      status.textContent = "Select at least TWO images first.";
+    if (!selection || selection.length < minimum) {
+      status.textContent = minimum === 1 ? "Select at least ONE image first." : "Select at least TWO images first.";
       return null;
     }
 
@@ -324,61 +435,77 @@ OBR.onReady(async () => {
     return images;
   }
 
-  function overlapsOtherLayers(ids: string[], excluded: "track" | "background" | "foreground"): boolean {
+  type AssignableKind = "floor" | "track" | "background" | "foreground" | "minecarts";
+
+  function overlapsOtherLayers(ids: string[], excluded: AssignableKind): boolean {
     const otherIds = [
+      ...(excluded === "floor" ? [] : floorIds),
       ...(excluded === "track" ? [] : trackIds),
       ...(excluded === "background" ? [] : backgroundIds),
       ...(excluded === "foreground" ? [] : foregroundIds),
+      ...(excluded === "minecarts" ? [] : minecartIds),
     ];
     const others = new Set(otherIds);
     return ids.some((id) => others.has(id));
   }
 
-  async function setLayer(kind: "track" | "background" | "foreground"): Promise<void> {
+  async function setLayer(kind: AssignableKind): Promise<void> {
     if (runState !== "stopped") {
       status.textContent = "Stop the chase before changing layers.";
       return;
     }
 
-    const images = await getSelectedImages();
+    const images = await getSelectedImages(kind === "minecarts" ? 1 : 2);
     if (!images) return;
 
     const ids = images.map((image) => image.id);
     if (overlapsOtherLayers(ids, kind)) {
-      status.textContent = "Each parallax layer must use different images.";
+      status.textContent = "Floor, scenery layers, and minecarts must use different images.";
       return;
     }
 
+    if (kind === "floor") floorIds = ids;
     if (kind === "track") trackIds = ids;
     if (kind === "background") backgroundIds = ids;
     if (kind === "foreground") foregroundIds = ids;
+    if (kind === "minecarts") minecartIds = ids;
 
     updateLayerLabels();
     await OBR.player.deselect();
     status.textContent = `${kind[0].toUpperCase()}${kind.slice(1)} layer set.`;
   }
 
+  setFloorButton.addEventListener("click", () => void setLayer("floor"));
   setTrackButton.addEventListener("click", () => void setLayer("track"));
   setBackgroundButton.addEventListener("click", () => void setLayer("background"));
   setForegroundButton.addEventListener("click", () => void setLayer("foreground"));
+  setMinecartsButton.addEventListener("click", () => void setLayer("minecarts"));
 
   function makeSavedSettings(): SavedSettings {
     readControls();
     return {
-      version: 2,
+      version: 3,
+      floorIds: [...floorIds],
       trackIds: [...trackIds],
       backgroundIds: [...backgroundIds],
       foregroundIds: [...foregroundIds],
+      minecartIds: [...minecartIds],
       anchorX,
       anchorY,
+      floorYOffset,
       trackYOffset,
       foregroundYOffset,
+      floorOverlap,
       backgroundOverlap,
       foregroundOverlap,
       targetSpeed,
       acceleration,
+      floorMultiplier,
       backgroundMultiplier,
       foregroundMultiplier,
+      rattleEnabled,
+      rattleStrength,
+      rattleStartSpeed,
       focusOnStart: focusOnStartCheckbox.checked,
     };
   }
@@ -387,39 +514,56 @@ OBR.onReady(async () => {
     if (!raw || typeof raw !== "object") return null;
     const value = raw as Partial<SavedSettings>;
     return {
-      version: 2,
+      version: 3,
+      floorIds: Array.isArray(value.floorIds) ? value.floorIds.filter((id): id is string => typeof id === "string") : [],
       trackIds: Array.isArray(value.trackIds) ? value.trackIds.filter((id): id is string => typeof id === "string") : [],
       backgroundIds: Array.isArray(value.backgroundIds) ? value.backgroundIds.filter((id): id is string => typeof id === "string") : [],
       foregroundIds: Array.isArray(value.foregroundIds) ? value.foregroundIds.filter((id): id is string => typeof id === "string") : [],
+      minecartIds: Array.isArray(value.minecartIds) ? value.minecartIds.filter((id): id is string => typeof id === "string") : [],
       anchorX: Number.isFinite(value.anchorX) ? Number(value.anchorX) : 0,
       anchorY: Number.isFinite(value.anchorY) ? Number(value.anchorY) : 0,
+      floorYOffset: clampNumber(Number(value.floorYOffset), -10000, 10000, 0),
       trackYOffset: clampNumber(Number(value.trackYOffset), -10000, 10000, 0),
       foregroundYOffset: clampNumber(Number(value.foregroundYOffset), -10000, 10000, 0),
+      floorOverlap: clampNumber(Number(value.floorOverlap), 0, 50, 0),
       backgroundOverlap: clampNumber(Number(value.backgroundOverlap), 0, 50, 0),
       foregroundOverlap: clampNumber(Number(value.foregroundOverlap), 0, 50, 0),
       targetSpeed: clampNumber(Number(value.targetSpeed), 0, 1000, 150),
       acceleration: clampNumber(Number(value.acceleration), 25, 1000, 200),
+      floorMultiplier: clampNumber(Number(value.floorMultiplier), 0, 1, 0.45),
       backgroundMultiplier: clampNumber(Number(value.backgroundMultiplier), 0, 1, 0.4),
       foregroundMultiplier: clampNumber(Number(value.foregroundMultiplier), 1, 2.5, 1.4),
+      rattleEnabled: typeof value.rattleEnabled === "boolean" ? value.rattleEnabled : true,
+      rattleStrength: clampNumber(Number(value.rattleStrength), 0, 2, 1),
+      rattleStartSpeed: clampNumber(Number(value.rattleStartSpeed), 0, 1000, 100),
       focusOnStart: typeof value.focusOnStart === "boolean" ? value.focusOnStart : true,
     };
   }
 
   function applySavedSettings(saved: SavedSettings): void {
+    floorIds = [...saved.floorIds];
     trackIds = [...saved.trackIds];
     backgroundIds = [...saved.backgroundIds];
     foregroundIds = [...saved.foregroundIds];
+    minecartIds = [...saved.minecartIds];
 
     anchorXInput.value = String(saved.anchorX);
     anchorYInput.value = String(saved.anchorY);
+    floorYOffsetInput.value = String(saved.floorYOffset);
     trackYOffsetInput.value = String(saved.trackYOffset);
     foregroundYOffsetInput.value = String(saved.foregroundYOffset);
+    floorOverlapInput.value = String(saved.floorOverlap);
     backgroundOverlapInput.value = String(saved.backgroundOverlap);
     foregroundOverlapInput.value = String(saved.foregroundOverlap);
+    rattleEnabledCheckbox.checked = saved.rattleEnabled;
+    rattleStrengthSlider.value = String(Math.round(saved.rattleStrength * 100));
+    rattleStrengthValue.textContent = String(Math.round(saved.rattleStrength * 100));
+    rattleStartSpeedInput.value = String(saved.rattleStartSpeed);
     focusOnStartCheckbox.checked = saved.focusOnStart;
 
     applyTargetSpeed(saved.targetSpeed);
     applyAcceleration(saved.acceleration);
+    applyFloorMultiplier(saved.floorMultiplier * 100);
     applyBackgroundMultiplier(saved.backgroundMultiplier * 100);
     applyForegroundMultiplier(saved.foregroundMultiplier * 100);
     readControls();
@@ -484,6 +628,41 @@ OBR.onReady(async () => {
     const images = items.filter(isImage);
     if (images.length !== ids.length) throw new Error(`One or more ${name.toLowerCase()} images are missing.`);
     return images;
+  }
+
+  async function getMinecartImages(ids: string[]): Promise<Image[]> {
+    if (ids.length === 0) return [];
+    const items = await OBR.scene.items.getItems(ids);
+    const images = items.filter(isImage);
+    if (images.length !== ids.length) throw new Error("One or more minecart images are missing.");
+    return images;
+  }
+
+  function seededUnit(value: string): number {
+    let hash = 2166136261;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0) / 4294967295;
+  }
+
+  function prepareMinecarts(images: Image[]): MinecartRattleGroup | null {
+    if (images.length === 0) return null;
+    const states = new Map<string, MinecartRattleState>();
+    for (const image of images) {
+      states.set(image.id, {
+        baseX: image.position.x,
+        baseY: image.position.y,
+        phaseA: seededUnit(`${image.id}:phaseA`) * Math.PI * 2,
+        phaseB: seededUnit(`${image.id}:phaseB`) * Math.PI * 2,
+        frequencyA: 3.5 + seededUnit(`${image.id}:freqA`) * 2.5,
+        frequencyB: 7 + seededUnit(`${image.id}:freqB`) * 4,
+        amplitudeScale: 0.75 + seededUnit(`${image.id}:amp`) * 0.5,
+        offsetY: 0,
+      });
+    }
+    return { images, states };
   }
 
   async function prepareLayer(
@@ -589,11 +768,13 @@ OBR.onReady(async () => {
   }
 
   function getActiveLayers(): LoopLayer[] {
-    return [activeBackground, activeTrack, activeForeground].filter((layer): layer is LoopLayer => layer !== null);
+    return [activeFloor, activeBackground, activeTrack, activeForeground].filter((layer): layer is LoopLayer => layer !== null);
   }
 
   function getActiveImages(): Image[] {
-    return getActiveLayers().flatMap((layer) => layer.images);
+    const scrolling = getActiveLayers().flatMap((layer) => layer.images);
+    const carts = activeMinecarts?.images ?? [];
+    return [...scrolling, ...carts];
   }
 
   function layerForItem(id: string): LoopLayer | null {
@@ -605,17 +786,40 @@ OBR.onReady(async () => {
 
   async function commitPositions(): Promise<void> {
     const layers = getActiveLayers();
-    if (layers.length === 0) return;
+    if (layers.length === 0 && !activeMinecarts) return;
     await Promise.all(layers.map((layer) => layer.zQueue));
     const images = getActiveImages();
 
     await OBR.scene.items.updateItems(images, (items) => {
       for (const item of items) {
         const layer = layerForItem(item.id);
-        if (!layer) continue;
-        const x = layer.positions.get(item.id);
-        if (x !== undefined) item.position.x = x;
-        item.position.y = layer.y;
+        if (layer) {
+          const x = layer.positions.get(item.id);
+          if (x !== undefined) item.position.x = x;
+          item.position.y = layer.y;
+          continue;
+        }
+
+        const cart = activeMinecarts?.states.get(item.id);
+        if (cart) {
+          item.position.x = cart.baseX;
+          item.position.y = cart.baseY + cart.offsetY;
+        }
+      }
+    });
+  }
+
+  async function resetMinecarts(): Promise<void> {
+    if (!activeMinecarts) return;
+    const images = activeMinecarts.images;
+    const states = activeMinecarts.states;
+    await OBR.scene.items.updateItems(images, (items) => {
+      for (const item of items) {
+        const cart = states.get(item.id);
+        if (!cart) continue;
+        cart.offsetY = 0;
+        item.position.x = cart.baseX;
+        item.position.y = cart.baseY;
       }
     });
   }
@@ -724,6 +928,26 @@ OBR.onReady(async () => {
     return current + Math.sign(difference) * maxDelta;
   }
 
+  function updateMinecartRattle(timeSeconds: number): void {
+    if (!activeMinecarts) return;
+    if (!rattleEnabled || currentSpeed <= rattleStartSpeed || rattleStrength <= 0) {
+      for (const cart of activeMinecarts.states.values()) cart.offsetY = 0;
+      return;
+    }
+
+    const range = Math.max(1, 1000 - rattleStartSpeed);
+    const raw = clampNumber((currentSpeed - rattleStartSpeed) / range, 0, 1, 0);
+    const intensity = raw * raw * (3 - 2 * raw);
+    const amplitude = 8 * intensity * rattleStrength;
+    const frequencyScale = 0.65 + raw * 1.6;
+
+    for (const cart of activeMinecarts.states.values()) {
+      const waveA = Math.sin(timeSeconds * cart.frequencyA * frequencyScale * Math.PI * 2 + cart.phaseA);
+      const waveB = Math.sin(timeSeconds * cart.frequencyB * frequencyScale * Math.PI * 2 + cart.phaseB);
+      cart.offsetY = amplitude * cart.amplitudeScale * (waveA * 0.65 + waveB * 0.35);
+    }
+  }
+
   function animate(time: number): void {
     if (runState !== "running") return;
 
@@ -732,9 +956,11 @@ OBR.onReady(async () => {
     currentSpeed = approach(currentSpeed, targetSpeed, acceleration * deltaTime);
     currentSpeedValue.textContent = String(Math.round(currentSpeed));
 
+    if (activeFloor) moveLayer(activeFloor, deltaTime, floorMultiplier);
     if (activeTrack) moveLayer(activeTrack, deltaTime, 1);
     if (activeBackground) moveLayer(activeBackground, deltaTime, backgroundMultiplier);
     if (activeForeground) moveLayer(activeForeground, deltaTime, foregroundMultiplier);
+    updateMinecartRattle(time / 1000);
 
     if (interactionUpdate) {
       interactionUpdate((draft) => {
@@ -742,10 +968,18 @@ OBR.onReady(async () => {
 
         for (const item of items) {
           const layer = layerForItem(item.id);
-          if (!layer) continue;
-          const x = layer.positions.get(item.id);
-          if (x !== undefined) item.position.x = x;
-          item.position.y = layer.y;
+          if (layer) {
+            const x = layer.positions.get(item.id);
+            if (x !== undefined) item.position.x = x;
+            item.position.y = layer.y;
+            continue;
+          }
+
+          const cart = activeMinecarts?.states.get(item.id);
+          if (cart) {
+            item.position.x = cart.baseX;
+            item.position.y = cart.baseY + cart.offsetY;
+          }
         }
       });
     }
@@ -755,11 +989,13 @@ OBR.onReady(async () => {
 
   async function prepareChase(): Promise<void> {
     readControls();
+    const floorImages = await getLayerImages(floorIds, "Floor", false);
     const trackImages = await getLayerImages(trackIds, "Track", true);
     const backgroundImages = await getLayerImages(backgroundIds, "Background", true);
     const foregroundImages = await getLayerImages(foregroundIds, "Foreground", false);
+    const minecartImages = await getMinecartImages(minecartIds);
 
-    const combined = [...trackImages, ...backgroundImages, ...foregroundImages];
+    const combined = [...floorImages, ...trackImages, ...backgroundImages, ...foregroundImages];
     const baseZ = Math.min(...combined.map((image) => image.zIndex));
 
     const sortedBackground = [...backgroundImages].sort((a, b) => a.position.x - b.position.x);
@@ -773,6 +1009,18 @@ OBR.onReady(async () => {
     activeBackground = await prepareLayer("Background", backgroundImages, baseZ, backgroundOverlap, backgroundOverride);
 
     const currentBackgroundBounds = await OBR.scene.items.getItemBounds([activeBackground.images[0].id]);
+
+    activeFloor = null;
+    if (floorImages.length >= 2) {
+      const sortedFloor = [...floorImages].sort((a, b) => a.position.x - b.position.x);
+      const firstFloor = sortedFloor[0];
+      const floorBounds = await OBR.scene.items.getItemBounds([firstFloor.id]);
+      const floorOverride = {
+        x: firstFloor.position.x + (currentBackgroundBounds.center.x - floorBounds.center.x),
+        y: firstFloor.position.y + (currentBackgroundBounds.center.y - floorBounds.center.y) + floorYOffset,
+      };
+      activeFloor = await prepareLayer("Floor", floorImages, baseZ - FLOOR_Z_GAP, floorOverlap, floorOverride);
+    }
 
     const sortedTrack = [...trackImages].sort((a, b) => a.position.x - b.position.x);
     const firstTrack = sortedTrack[0];
@@ -802,6 +1050,8 @@ OBR.onReady(async () => {
         foregroundOverride,
       );
     }
+
+    activeMinecarts = prepareMinecarts(minecartImages);
   }
 
   startButton.addEventListener("click", async () => {
@@ -823,12 +1073,15 @@ OBR.onReady(async () => {
       animationFrame = requestAnimationFrame(animate);
       scheduleRenewal();
       updateRunButtons();
-      status.textContent = activeForeground ? "Three-layer parallax chase running!" : "Parallax chase running!";
+      const extras = [activeFloor ? "floor" : "", activeForeground ? "foreground" : "", activeMinecarts ? "minecart rattle" : ""].filter(Boolean);
+      status.textContent = extras.length > 0 ? `Chase running with ${extras.join(", ")}.` : "Parallax chase running!";
     } catch (error) {
       status.textContent = error instanceof Error ? error.message : "Could not start the chase.";
+      activeFloor = null;
       activeTrack = null;
       activeBackground = null;
       activeForeground = null;
+      activeMinecarts = null;
       runState = "stopped";
       updateRunButtons();
     }
@@ -872,31 +1125,37 @@ OBR.onReady(async () => {
 
     if (runState === "running") await commitPositions();
     closeInteraction();
+    await resetMinecarts();
 
     currentSpeed = 0;
     currentSpeedValue.textContent = "0";
+    activeFloor = null;
     activeTrack = null;
     activeBackground = null;
     activeForeground = null;
+    activeMinecarts = null;
     runState = "stopped";
     updateRunButtons();
     status.textContent = "Stopped. Start will rebuild the chase at the anchor.";
   });
 
-  emergencyResetButton.addEventListener("click", () => {
+  emergencyResetButton.addEventListener("click", async () => {
     clearRenewTimer();
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
     closeInteraction();
+    await resetMinecarts();
     renewing = false;
     currentSpeed = 0;
     currentSpeedValue.textContent = "0";
+    activeFloor = null;
     activeTrack = null;
     activeBackground = null;
     activeForeground = null;
+    activeMinecarts = null;
     runState = "stopped";
     updateRunButtons();
-    status.textContent = "Emergency reset complete. Current interaction stopped; saved settings were kept.";
+    status.textContent = "Emergency reset complete. Current interaction stopped; minecarts restored; saved settings were kept.";
   });
 
   updateLayerLabels();
