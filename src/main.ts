@@ -322,7 +322,6 @@ async function arrangeSourceLayer(
       item.position.y = startY;
       item.zIndex = zBase + index;
       item.disableAutoZIndex = true;
-      item.visible = false;
     }
   });
 
@@ -340,83 +339,81 @@ async function prepareSources(settings: SavedSettings): Promise<void> {
   const combined = [...scenery, ...minecarts];
   const baseZ = scenery.length > 0 ? Math.min(...scenery.map((image) => image.zIndex)) : 0;
 
-  // Make sources measurable even after a previous interrupted run, then hide them after preparation.
+  // Keep the real scene items visible until every measurement and layout step has succeeded.
+  // If anything throws, the catch block restores them so a failed Start can never strand the scene hidden.
   await OBR.scene.items.updateItems(combined, (items) => {
     for (const item of items) item.visible = true;
   });
 
-  const sortedBackground = [...background].sort((a, b) => a.position.x - b.position.x);
-  const firstBackground = sortedBackground[0];
-  const backgroundBounds = await OBR.scene.items.getItemBounds([firstBackground.id]);
-  const backgroundOverride = {
-    x: firstBackground.position.x + (settings.anchorX - backgroundBounds.center.x),
-    y: firstBackground.position.y + (settings.anchorY - backgroundBounds.center.y),
-  };
-
-  const preparedBackground = await arrangeSourceLayer(
-    "Background",
-    background,
-    baseZ + Z_GAP,
-    settings.backgroundOverlap,
-    backgroundOverride,
-  );
-
-  // Temporarily reveal the first prepared background only while measuring its actual centered bounds.
-  await OBR.scene.items.updateItems([preparedBackground[0]], (items) => {
-    if (items[0]) items[0].visible = true;
-  });
-  const currentBackgroundBounds = await OBR.scene.items.getItemBounds([preparedBackground[0].id]);
-  await OBR.scene.items.updateItems([preparedBackground[0]], (items) => {
-    if (items[0]) items[0].visible = false;
-  });
-
-  if (floor.length >= 2) {
-    const sortedFloor = [...floor].sort((a, b) => a.position.x - b.position.x);
-    const firstFloor = sortedFloor[0];
-    const floorBounds = await OBR.scene.items.getItemBounds([firstFloor.id]);
-    const floorOverride = {
-      x: firstFloor.position.x + (currentBackgroundBounds.center.x - floorBounds.center.x),
-      y:
-        firstFloor.position.y +
-        (currentBackgroundBounds.center.y - floorBounds.center.y) +
-        settings.floorYOffset,
+  try {
+    const sortedBackground = [...background].sort((a, b) => a.position.x - b.position.x);
+    const firstBackground = sortedBackground[0];
+    const backgroundBounds = await OBR.scene.items.getItemBounds([firstBackground.id]);
+    const backgroundOverride = {
+      x: firstBackground.position.x + (settings.anchorX - backgroundBounds.center.x),
+      y: firstBackground.position.y + (settings.anchorY - backgroundBounds.center.y),
     };
-    await arrangeSourceLayer("Floor", floor, baseZ, settings.floorOverlap, floorOverride);
-  }
 
-  const sortedTrack = [...track].sort((a, b) => a.position.x - b.position.x);
-  const firstTrack = sortedTrack[0];
-  const trackBounds = await OBR.scene.items.getItemBounds([firstTrack.id]);
-  const trackOverride = {
-    x: firstTrack.position.x + (currentBackgroundBounds.center.x - trackBounds.center.x),
-    y: firstTrack.position.y + (currentBackgroundBounds.center.y - trackBounds.center.y) + settings.trackYOffset,
-  };
-  await arrangeSourceLayer("Track", track, baseZ + Z_GAP * 2, TRACK_OVERLAP, trackOverride);
-
-  if (foreground.length >= 2) {
-    const sortedForeground = [...foreground].sort((a, b) => a.position.x - b.position.x);
-    const firstForeground = sortedForeground[0];
-    const foregroundBounds = await OBR.scene.items.getItemBounds([firstForeground.id]);
-    const foregroundOverride = {
-      x: firstForeground.position.x + (currentBackgroundBounds.center.x - foregroundBounds.center.x),
-      y:
-        firstForeground.position.y +
-        (currentBackgroundBounds.center.y - foregroundBounds.center.y) +
-        settings.foregroundYOffset,
-    };
     await arrangeSourceLayer(
-      "Foreground",
-      foreground,
-      baseZ + Z_GAP * 4,
-      settings.foregroundOverlap,
-      foregroundOverride,
+      "Background",
+      background,
+      baseZ + Z_GAP,
+      settings.backgroundOverlap,
+      backgroundOverride,
     );
-  }
 
-  if (minecarts.length > 0) {
-    await OBR.scene.items.updateItems(minecarts, (items) => {
+    // Background is centered directly on the anchor, so all other layer centers can use the
+    // same anchor without temporarily showing/hiding one background strip just to re-measure it.
+    if (floor.length >= 2) {
+      const sortedFloor = [...floor].sort((a, b) => a.position.x - b.position.x);
+      const firstFloor = sortedFloor[0];
+      const floorBounds = await OBR.scene.items.getItemBounds([firstFloor.id]);
+      const floorOverride = {
+        x: firstFloor.position.x + (settings.anchorX - floorBounds.center.x),
+        y: firstFloor.position.y + (settings.anchorY - floorBounds.center.y) + settings.floorYOffset,
+      };
+      await arrangeSourceLayer("Floor", floor, baseZ, settings.floorOverlap, floorOverride);
+    }
+
+    const sortedTrack = [...track].sort((a, b) => a.position.x - b.position.x);
+    const firstTrack = sortedTrack[0];
+    const trackBounds = await OBR.scene.items.getItemBounds([firstTrack.id]);
+    const trackOverride = {
+      x: firstTrack.position.x + (settings.anchorX - trackBounds.center.x),
+      y: firstTrack.position.y + (settings.anchorY - trackBounds.center.y) + settings.trackYOffset,
+    };
+    await arrangeSourceLayer("Track", track, baseZ + Z_GAP * 2, TRACK_OVERLAP, trackOverride);
+
+    if (foreground.length >= 2) {
+      const sortedForeground = [...foreground].sort((a, b) => a.position.x - b.position.x);
+      const firstForeground = sortedForeground[0];
+      const foregroundBounds = await OBR.scene.items.getItemBounds([firstForeground.id]);
+      const foregroundOverride = {
+        x: firstForeground.position.x + (settings.anchorX - foregroundBounds.center.x),
+        y:
+          firstForeground.position.y +
+          (settings.anchorY - foregroundBounds.center.y) +
+          settings.foregroundYOffset,
+      };
+      await arrangeSourceLayer(
+        "Foreground",
+        foreground,
+        baseZ + Z_GAP * 4,
+        settings.foregroundOverlap,
+        foregroundOverride,
+      );
+    }
+
+    // Only hide the real scene items after all layout work has succeeded. Local renderers
+    // replace these with temporary copies while the chase is active.
+    await OBR.scene.items.updateItems(combined, (items) => {
       for (const item of items) item.visible = false;
     });
+  } catch (error) {
+    await OBR.scene.items.updateItems(combined, (items) => {
+      for (const item of items) item.visible = true;
+    });
+    throw error;
   }
 }
 
@@ -468,6 +465,32 @@ async function commitSourcesAtDistance(runtime: RuntimeState, distance: number):
     const carts = await OBR.scene.items.getItems(runtime.minecartIds);
     await OBR.scene.items.updateItems(carts, (items) => {
       for (const item of items) item.visible = true;
+    });
+  }
+}
+
+async function restoreAssignedSourcesWhenStopped(): Promise<void> {
+  if (!(await OBR.scene.isReady())) return;
+  const metadata = await OBR.scene.getMetadata();
+  const runtime = parseRuntime(metadata[RUNTIME_KEY]);
+  if (runtime && runtime.runState !== "stopped") return;
+  const settings = parseSavedSettings(metadata[SETTINGS_KEY]);
+  if (!settings) return;
+
+  const ids = Array.from(
+    new Set([
+      ...settings.floorIds,
+      ...settings.backgroundIds,
+      ...settings.trackIds,
+      ...settings.minecartIds,
+      ...settings.foregroundIds,
+    ]),
+  );
+  if (ids.length === 0) return;
+  const items = await OBR.scene.items.getItems(ids);
+  if (items.length > 0) {
+    await OBR.scene.items.updateItems(items, (draft) => {
+      for (const item of draft) item.visible = true;
     });
   }
 }
@@ -672,13 +695,6 @@ function cartRattleOffset(
   return clampNumber((primary * 0.72 + chatter * 0.28) * amplitude, -MAX_RATTLE_OFFSET * strength, MAX_RATTLE_OFFSET * strength, 0);
 }
 
-function localLayerStyle(kind: LayerKind): { layer: Image["layer"]; baseZ: number } {
-  if (kind === "floor") return { layer: "MAP", baseZ: 0 };
-  if (kind === "background") return { layer: "MAP", baseZ: Z_GAP };
-  if (kind === "track") return { layer: "MAP", baseZ: Z_GAP * 2 };
-  return { layer: "ATTACHMENT", baseZ: 0 };
-}
-
 async function makeLocalLayer(kind: LayerKind, ids: string[], multiplier: number): Promise<LocalLayer | null> {
   if (ids.length < 2) return null;
   const sources = await OBR.scene.items.getItems(ids);
@@ -686,8 +702,7 @@ async function makeLocalLayer(kind: LayerKind, ids: string[], multiplier: number
   if (images.length !== ids.length || images.length < 2) return null;
 
   const spacing = Math.abs(images[1].position.x - images[0].position.x);
-  const style = localLayerStyle(kind);
-  const clones = images.map((source, index) => cloneImageForLocal(source, style.layer, style.baseZ + index));
+  const clones = images.map((source) => cloneImageForLocal(source));
   await OBR.scene.local.addItems(clones);
   const localItems = await OBR.scene.local.getItems(clones.map((clone) => clone.id));
   const localById = new Map<string, Image>(localItems.filter(isImage).map((image) => [image.id, image] as const));
@@ -702,7 +717,7 @@ async function makeLocalLayer(kind: LayerKind, ids: string[], multiplier: number
     startX: images[0].position.x,
     y: images[0].position.y,
     spacing,
-    baseZ: style.baseZ,
+    baseZ: images[0].zIndex,
     multiplier,
     lastOrderSignature: "",
     zQueue: Promise.resolve(),
@@ -715,8 +730,9 @@ async function makeLocalMinecarts(ids: string[]): Promise<LocalMinecart[]> {
   const images = sources.filter(isImage);
   if (images.length !== ids.length) return [];
 
-  // MOUNT keeps carts above the MAP scenery while ordinary CHARACTER tokens can still sit on top of them.
-  const clones = images.map((source) => cloneImageForLocal(source, "MOUNT", source.zIndex));
+  // Preserve each cart's original Owlbear layer. This avoids triggering special Mount/Attachment
+  // semantics while still allowing the cart to rattle locally.
+  const clones = images.map((source) => cloneImageForLocal(source));
   await OBR.scene.local.addItems(clones);
   const localItems = await OBR.scene.local.getItems(clones.map((clone) => clone.id));
   const localById = new Map<string, Image>(localItems.filter(isImage).map((image) => [image.id, image] as const));
@@ -1417,7 +1433,10 @@ const backgroundMode = new URLSearchParams(window.location.search).get("backgrou
 
 if (backgroundMode) {
   OBR.onReady(() => {
-    void runLocalRendererBackground();
+    void (async () => {
+      await restoreAssignedSourcesWhenStopped();
+      await runLocalRendererBackground();
+    })();
     void runControllerBackground();
   });
 } else {
