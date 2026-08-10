@@ -117,7 +117,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <fieldset>
         <legend><strong>Motion</strong></legend>
         <label>Main Target Speed: <strong><span id="targetSpeedValue">150</span></strong></label>
-        <input id="targetSpeedSlider" type="range" min="0" max="750" value="150" step="25" style="width:100%;">
+        <input id="targetSpeedSlider" type="range" min="0" max="1000" value="150" step="25" style="width:100%;">
 
         <p style="margin:8px 0;">Current Speed: <strong><span id="currentSpeedValue">0</span></strong></p>
 
