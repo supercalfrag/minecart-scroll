@@ -9,7 +9,6 @@ const STATUS_CHANNEL = "com.supercalfrag.minecart-scroll/status";
 const TRACK_OVERLAP = 2;
 const TRACK_Z_GAP = 100000;
 const FOREGROUND_Z_GAP = 200000;
-const LOCAL_CLONE_Z_OFFSET = 50000; // Keep animated local copies above stationary source art.
 const LOCAL_TICK_MS = 20; // 50fps target. Absolute-time motion prevents cumulative drift.
 
 type RunState = "stopped" | "running" | "paused";
@@ -146,7 +145,7 @@ function parseSavedSettings(raw: unknown): SavedSettings | null {
     foregroundYOffset: clampNumber(Number(value.foregroundYOffset), -10000, 10000, 0),
     backgroundOverlap: clampNumber(Number(value.backgroundOverlap), 0, 50, 0),
     foregroundOverlap: clampNumber(Number(value.foregroundOverlap), 0, 50, 0),
-    targetSpeed: clampNumber(Number(value.targetSpeed), 0, 1000, 150),
+    targetSpeed: clampNumber(Number(value.targetSpeed), 0, 750, 150),
     acceleration: clampNumber(Number(value.acceleration), 25, 1000, 200),
     backgroundMultiplier: clampNumber(Number(value.backgroundMultiplier), 0, 1, 0.4),
     foregroundMultiplier: clampNumber(Number(value.foregroundMultiplier), 1, 2.5, 1.4),
@@ -177,8 +176,8 @@ function parseRuntime(raw: unknown): RuntimeState | null {
     motion: {
       segmentStartMs: Number.isFinite(motion.segmentStartMs) ? Number(motion.segmentStartMs) : Date.now(),
       distanceAtSegmentStart: Number.isFinite(motion.distanceAtSegmentStart) ? Number(motion.distanceAtSegmentStart) : 0,
-      speedAtSegmentStart: clampNumber(Number(motion.speedAtSegmentStart), 0, 1000, 0),
-      targetSpeed: clampNumber(Number(motion.targetSpeed), 0, 1000, 150),
+      speedAtSegmentStart: clampNumber(Number(motion.speedAtSegmentStart), 0, 750, 0),
+      targetSpeed: clampNumber(Number(motion.targetSpeed), 0, 750, 150),
       acceleration: clampNumber(Number(motion.acceleration), 25, 1000, 200),
     },
   };
@@ -216,7 +215,7 @@ function cloneImageForLocal(source: Image): Image {
     .rotation(source.rotation)
     .scale({ ...source.scale })
     .layer(source.layer)
-    .zIndex(source.zIndex + LOCAL_CLONE_Z_OFFSET)
+    .zIndex(source.zIndex)
     .visible(true)
     .locked(true)
     .disableHit(true)
@@ -266,7 +265,7 @@ async function arrangeSourceLayer(
       item.position.y = startY;
       item.zIndex = zBase + index;
       item.disableAutoZIndex = true;
-      // Source items deliberately remain visible. Local scrolling copies render on top.
+      item.visible = false;
     }
   });
 
@@ -302,8 +301,14 @@ async function prepareSources(settings: SavedSettings): Promise<void> {
     backgroundOverride,
   );
 
-  // Source items are never hidden; measure the prepared background directly.
+  // Temporarily reveal the first prepared background only while measuring its actual centered bounds.
+  await OBR.scene.items.updateItems([preparedBackground[0]], (items) => {
+    if (items[0]) items[0].visible = true;
+  });
   const currentBackgroundBounds = await OBR.scene.items.getItemBounds([preparedBackground[0].id]);
+  await OBR.scene.items.updateItems([preparedBackground[0]], (items) => {
+    if (items[0]) items[0].visible = false;
+  });
 
   const sortedTrack = [...track].sort((a, b) => a.position.x - b.position.x);
   const firstTrack = sortedTrack[0];
@@ -479,7 +484,7 @@ async function runControllerBackground(): Promise<void> {
         }
 
         if (command.type === "SET_TARGET_SPEED") {
-          const targetSpeed = clampNumber(command.value, 0, 1000, current.motion.targetSpeed);
+          const targetSpeed = clampNumber(command.value, 0, 750, current.motion.targetSpeed);
           await writeRuntime({
             ...current,
             revision: current.revision + 1,
@@ -537,7 +542,7 @@ async function makeLocalLayer(kind: LayerKind, ids: string[], multiplier: number
     startX: images[0].position.x,
     y: images[0].position.y,
     spacing,
-    baseZ: images[0].zIndex + LOCAL_CLONE_Z_OFFSET,
+    baseZ: images[0].zIndex,
     multiplier,
     lastOrderSignature: "",
     zQueue: Promise.resolve(),
@@ -576,15 +581,6 @@ async function runLocalRendererBackground(): Promise<void> {
       if (track) layers.push(track);
       if (foreground) layers.push(foreground);
       localLayers = layers;
-
-      if (layers.length === 0) {
-        throw new Error("No scrolling layers could be created from the assigned images.");
-      }
-    } catch (error) {
-      localLayers = [];
-      const message = error instanceof Error ? error.message : "Unknown local renderer error.";
-      console.error("Minecart Scroll renderer failed:", error);
-      await sendStatus(false, `Renderer failed: ${message}`);
     } finally {
       syncing = false;
     }
@@ -746,7 +742,7 @@ function renderUI(): void {
         <fieldset>
           <legend><strong>Motion</strong></legend>
           <label>Main Target Speed: <strong><span id="targetSpeedValue">150</span></strong></label>
-          <input id="targetSpeedSlider" type="range" min="0" max="1000" value="150" step="25" style="width:100%;">
+          <input id="targetSpeedSlider" type="range" min="0" max="750" value="150" step="25" style="width:100%;">
           <p style="margin:8px 0;">Current Speed: <strong><span id="currentSpeedValue">0</span></strong></p>
           <label>Acceleration / Braking: <strong><span id="accelerationValue">200</span></strong></label>
           <input id="accelerationSlider" type="range" min="25" max="1000" value="200" step="25" style="width:100%;">
@@ -861,7 +857,7 @@ async function runUI(): Promise<void> {
       foregroundYOffset: clampNumber(Number(foregroundYOffsetInput.value), -10000, 10000, 0),
       backgroundOverlap: clampNumber(Number(backgroundOverlapInput.value), 0, 50, 0),
       foregroundOverlap: clampNumber(Number(foregroundOverlapInput.value), 0, 50, 0),
-      targetSpeed: clampNumber(Number(targetSpeedSlider.value), 0, 1000, 150),
+      targetSpeed: clampNumber(Number(targetSpeedSlider.value), 0, 750, 150),
       acceleration: clampNumber(Number(accelerationSlider.value), 25, 1000, 200),
       backgroundMultiplier: clampNumber(Number(backgroundMultiplierSlider.value), 0, 100, 40) / 100,
       foregroundMultiplier: clampNumber(Number(foregroundMultiplierSlider.value), 100, 250, 140) / 100,
@@ -954,157 +950,8 @@ async function runUI(): Promise<void> {
     status.textContent = `${kind[0].toUpperCase()}${kind.slice(1)} layer set.`;
   }
 
-  async function applyCommandDirect(command: ControlCommand): Promise<void> {
-    if (!(await OBR.scene.isReady())) {
-      status.textContent = "Open a scene first.";
-      return;
-    }
-
-    try {
-      const current = await readRuntime();
-      const now = Date.now();
-
-      if (command.type === "START") {
-        const settings = parseSavedSettings(command.settings);
-        if (!settings) throw new Error("Invalid chase settings.");
-
-        await prepareSources(settings);
-
-        const next: RuntimeState = {
-          version: 3,
-          revision: (current?.revision ?? 0) + 1,
-          runState: "running",
-          controllerId: OBR.player.id,
-          trackIds: [...settings.trackIds],
-          backgroundIds: [...settings.backgroundIds],
-          foregroundIds: [...settings.foregroundIds],
-          backgroundMultiplier: settings.backgroundMultiplier,
-          foregroundMultiplier: settings.foregroundMultiplier,
-          motion: {
-            segmentStartMs: now,
-            distanceAtSegmentStart: 0,
-            speedAtSegmentStart: 0,
-            targetSpeed: settings.targetSpeed,
-            acceleration: settings.acceleration,
-          },
-        };
-
-        await writeRuntime(next);
-        runtime = next;
-        updateButtons();
-        status.textContent = "Chase started.";
-        return;
-      }
-
-      if (!current || current.runState === "stopped") {
-        throw new Error("No active chase.");
-      }
-
-      const snapshot =
-        current.runState === "running"
-          ? motionAt(current.motion, now)
-          : { distance: current.motion.distanceAtSegmentStart, speed: 0 };
-
-      if (command.type === "PAUSE") {
-        if (current.runState !== "running") return;
-        const next: RuntimeState = {
-          ...current,
-          revision: current.revision + 1,
-          runState: "paused",
-          motion: {
-            ...current.motion,
-            segmentStartMs: now,
-            distanceAtSegmentStart: snapshot.distance,
-            speedAtSegmentStart: 0,
-          },
-        };
-        await writeRuntime(next);
-        runtime = next;
-        updateButtons();
-        status.textContent = "Paused — positions preserved.";
-        return;
-      }
-
-      if (command.type === "RESUME") {
-        if (current.runState !== "paused") return;
-        const next: RuntimeState = {
-          ...current,
-          revision: current.revision + 1,
-          runState: "running",
-          motion: {
-            ...current.motion,
-            segmentStartMs: now,
-            distanceAtSegmentStart: current.motion.distanceAtSegmentStart,
-            speedAtSegmentStart: 0,
-          },
-        };
-        await writeRuntime(next);
-        runtime = next;
-        updateButtons();
-        status.textContent = "Resumed.";
-        return;
-      }
-
-      if (command.type === "STOP") {
-        const finalDistance =
-          current.runState === "running" ? snapshot.distance : current.motion.distanceAtSegmentStart;
-
-        await commitSourcesAtDistance(current, finalDistance);
-
-        const next: RuntimeState = {
-          ...current,
-          revision: current.revision + 1,
-          runState: "stopped",
-          motion: {
-            ...current.motion,
-            segmentStartMs: now,
-            distanceAtSegmentStart: finalDistance,
-            speedAtSegmentStart: 0,
-          },
-        };
-        await writeRuntime(next);
-        runtime = next;
-        updateButtons();
-        status.textContent = "Chase stopped.";
-        return;
-      }
-
-      if (command.type === "SET_TARGET_SPEED") {
-        const next: RuntimeState = {
-          ...current,
-          revision: current.revision + 1,
-          motion: {
-            ...current.motion,
-            segmentStartMs: now,
-            distanceAtSegmentStart: snapshot.distance,
-            speedAtSegmentStart: current.runState === "running" ? snapshot.speed : 0,
-            targetSpeed: clampNumber(command.value, 0, 1000, current.motion.targetSpeed),
-          },
-        };
-        await writeRuntime(next);
-        runtime = next;
-        return;
-      }
-
-      if (command.type === "SET_ACCELERATION") {
-        const next: RuntimeState = {
-          ...current,
-          revision: current.revision + 1,
-          motion: {
-            ...current.motion,
-            segmentStartMs: now,
-            distanceAtSegmentStart: snapshot.distance,
-            speedAtSegmentStart: current.runState === "running" ? snapshot.speed : 0,
-            acceleration: clampNumber(command.value, 25, 1000, current.motion.acceleration),
-          },
-        };
-        await writeRuntime(next);
-        runtime = next;
-      }
-    } catch (error) {
-      status.textContent = error instanceof Error ? error.message : "Minecart Scroll command failed.";
-      console.error("Minecart Scroll command failed:", error);
-    }
+  async function sendCommand(command: ControlCommand): Promise<void> {
+    await OBR.broadcast.sendMessage(CONTROL_CHANNEL, command, { destination: "LOCAL" });
   }
 
   async function goToAnchor(): Promise<void> {
@@ -1133,14 +980,14 @@ async function runUI(): Promise<void> {
   targetSpeedSlider.addEventListener("input", () => {
     targetSpeedValue.textContent = targetSpeedSlider.value;
     if (currentState() !== "stopped") {
-      void applyCommandDirect({ type: "SET_TARGET_SPEED", value: Number(targetSpeedSlider.value) });
+      void sendCommand({ type: "SET_TARGET_SPEED", value: Number(targetSpeedSlider.value) });
     }
   });
 
   accelerationSlider.addEventListener("input", () => {
     accelerationValue.textContent = accelerationSlider.value;
     if (currentState() !== "stopped") {
-      void applyCommandDirect({ type: "SET_ACCELERATION", value: Number(accelerationSlider.value) });
+      void sendCommand({ type: "SET_ACCELERATION", value: Number(accelerationSlider.value) });
     }
   });
 
@@ -1159,11 +1006,12 @@ async function runUI(): Promise<void> {
     }
     if (settings.focusOnStart) await goToAnchor();
     await OBR.player.deselect();
-    await applyCommandDirect({ type: "START", settings });
+    await sendCommand({ type: "START", settings });
+    status.textContent = "Starting chase...";
   });
-  pauseButton.addEventListener("click", () => void applyCommandDirect({ type: "PAUSE" }));
-  resumeButton.addEventListener("click", () => void applyCommandDirect({ type: "RESUME" }));
-  stopButton.addEventListener("click", () => void applyCommandDirect({ type: "STOP" }));
+  pauseButton.addEventListener("click", () => void sendCommand({ type: "PAUSE" }));
+  resumeButton.addEventListener("click", () => void sendCommand({ type: "RESUME" }));
+  stopButton.addEventListener("click", () => void sendCommand({ type: "STOP" }));
 
   OBR.broadcast.onMessage(STATUS_CHANNEL, (event) => {
     const message = event.data as StatusMessage;
@@ -1202,18 +1050,12 @@ async function runUI(): Promise<void> {
   updateButtons();
 }
 
-
 const backgroundMode = new URLSearchParams(window.location.search).get("background") === "1";
 
 if (backgroundMode) {
   OBR.onReady(() => {
-    // Start renderer and legacy control listener independently so one cannot block the other.
-    void runLocalRendererBackground().catch((error) =>
-      console.error("Minecart Scroll background renderer failed to start:", error),
-    );
-    void runControllerBackground().catch((error) =>
-      console.error("Minecart Scroll background controller failed to start:", error),
-    );
+    void runLocalRendererBackground();
+    void runControllerBackground();
   });
 } else {
   renderUI();
