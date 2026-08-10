@@ -7,6 +7,7 @@ const TRACK_Z_GAP = 100000;
 const FOREGROUND_Z_GAP = 200000;
 const INTERACTION_RENEW_MS = 20000;
 const MINECART_UPDATE_INTERVAL_MS = 50;
+const MINECART_DROP_SETTLE_MS = 250;
 
 type RunState = "stopped" | "running" | "paused";
 
@@ -309,6 +310,8 @@ OBR.onReady(async () => {
   let activeForeground: LoopLayer | null = null;
   let activeMinecarts: MinecartRattleGroup | null = null;
   let selectedItemIds = new Set<string>();
+  const minecartSuspended = new Set<string>();
+  const minecartSettleTimers = new Map<string, number>();
   let minecartWriteInFlight = false;
   let lastMinecartWriteTime = 0;
 
@@ -814,6 +817,10 @@ OBR.onReady(async () => {
   }
 
   async function resetMinecarts(): Promise<void> {
+    for (const timer of minecartSettleTimers.values()) window.clearTimeout(timer);
+    minecartSettleTimers.clear();
+    minecartSuspended.clear();
+
     if (!activeMinecarts) return;
     const images = activeMinecarts.images;
     const states = activeMinecarts.states;
@@ -832,8 +839,72 @@ OBR.onReady(async () => {
 
   selectedItemIds = new Set((await OBR.player.getSelection()) ?? []);
 
+  function suspendMinecart(id: string): void {
+    if (!activeMinecarts?.states.has(id)) return;
+    minecartSuspended.add(id);
+
+    const existing = minecartSettleTimers.get(id);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+      minecartSettleTimers.delete(id);
+    }
+  }
+
+  function scheduleMinecartDropCapture(id: string): void {
+    if (!activeMinecarts?.states.has(id)) return;
+
+    suspendMinecart(id);
+
+    const timer = window.setTimeout(() => {
+      minecartSettleTimers.delete(id);
+
+      void OBR.scene.items
+        .getItems([id])
+        .then((items) => {
+          if (!activeMinecarts) return;
+          const item = items.find((candidate) => candidate.id === id);
+          const cart = activeMinecarts.states.get(id);
+          if (!item || !cart || !isImage(item)) return;
+
+          // No external movement has arrived for the settle window, so treat
+          // this as the dropped position and resume rattle from here.
+          cart.baseX = item.position.x;
+          cart.baseY = item.position.y;
+          cart.offsetY = 0;
+          cart.lastWrittenX = item.position.x;
+          cart.lastWrittenY = item.position.y;
+          minecartSuspended.delete(id);
+        })
+        .catch((error) => {
+          console.error("Minecart drop capture failed:", error);
+          minecartSuspended.delete(id);
+        });
+    }, MINECART_DROP_SETTLE_MS);
+
+    minecartSettleTimers.set(id, timer);
+  }
+
   OBR.player.onChange((player) => {
-    selectedItemIds = new Set(player.selection ?? []);
+    const nextSelection = new Set<string>(player.selection ?? []);
+
+    if (activeMinecarts) {
+      for (const id of nextSelection) {
+        if (!selectedItemIds.has(id) && activeMinecarts.states.has(id)) {
+          // Picking up/selecting a cart suspends rattle immediately.
+          suspendMinecart(id);
+        }
+      }
+
+      for (const id of selectedItemIds) {
+        if (!nextSelection.has(id) && activeMinecarts.states.has(id)) {
+          // If Owlbear clears selection on drop, use that as an additional
+          // signal to begin the settle window.
+          scheduleMinecartDropCapture(id);
+        }
+      }
+    }
+
+    selectedItemIds = nextSelection;
   });
 
   OBR.scene.items.onChange((items) => {
@@ -848,14 +919,15 @@ OBR.onReady(async () => {
         Math.abs(item.position.y - cart.lastWrittenY) < 0.01;
       if (matchesLastWrite) continue;
 
-      // A player (or another extension) moved the cart. Treat the dropped
-      // position as its new resting point, then let the rattle continue around it.
+      // This was an external move (normally a drag). Stop all rattle writes,
+      // remember the latest position, and restart the drop timer. Every new
+      // drag update extends the timer, so rattle cannot resume mid-drag.
       cart.baseX = item.position.x;
       cart.baseY = item.position.y;
       cart.offsetY = 0;
       cart.lastWrittenX = item.position.x;
       cart.lastWrittenY = item.position.y;
-
+      scheduleMinecartDropCapture(item.id);
     }
   });
 
@@ -874,9 +946,9 @@ OBR.onReady(async () => {
           const cart = states.get(item.id);
           if (!cart) continue;
 
-          // While a cart is selected, leave it completely alone so Owlbear's
-          // normal pointer tool can drag it without fighting the rattle.
-          if (selectedItemIds.has(item.id)) continue;
+          // A suspended cart is being picked up, dragged, or settling after a drop.
+          // Minecart Scroll writes absolutely nothing to it until the settle timer ends.
+          if (minecartSuspended.has(item.id)) continue;
 
           const x = cart.baseX;
           const y = cart.baseY + cart.offsetY;
