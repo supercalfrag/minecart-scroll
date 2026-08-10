@@ -141,6 +141,11 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="pauseButton" disabled>Pause</button>
         <button id="resumeButton" disabled>Resume</button>
         <button id="stopButton" disabled>Stop</button>
+        <br><br>
+        <button id="emergencyResetButton" style="width:100%;">Emergency Reset</button>
+        <p style="font-size: 12px; margin-bottom: 0;">
+          Stops this extension's active animation/interaction without changing saved layer assignments.
+        </p>
       </fieldset>
     </div>
   </div>
@@ -195,6 +200,7 @@ OBR.onReady(async () => {
   const pauseButton = document.querySelector<HTMLButtonElement>("#pauseButton")!;
   const resumeButton = document.querySelector<HTMLButtonElement>("#resumeButton")!;
   const stopButton = document.querySelector<HTMLButtonElement>("#stopButton")!;
+  const emergencyResetButton = document.querySelector<HTMLButtonElement>("#emergencyResetButton")!;
 
   let trackIds: string[] = [];
   let backgroundIds: string[] = [];
@@ -615,12 +621,23 @@ OBR.onReady(async () => {
   }
 
   function closeInteraction(): void {
-    if (interactionStop) interactionStop();
+    const stop = interactionStop;
     interactionUpdate = null;
     interactionStop = null;
+
+    if (stop) {
+      try {
+        stop();
+      } catch (error) {
+        console.error("Could not stop Minecart Scroll interaction:", error);
+      }
+    }
   }
 
   async function openInteraction(): Promise<void> {
+    // Defensive cleanup: this instance must never own two interactions at once.
+    closeInteraction();
+
     const activeImages = getActiveImages();
     const ids = activeImages.map((image) => image.id);
     const refreshed = await OBR.scene.items.getItems(ids);
@@ -636,6 +653,38 @@ OBR.onReady(async () => {
     if (renewTimer) window.clearTimeout(renewTimer);
     renewTimer = 0;
   }
+
+  function cleanupInteractionForPageExit(): void {
+    clearRenewTimer();
+    if (animationFrame) cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
+    closeInteraction();
+  }
+
+  async function pauseForHiddenPanel(): Promise<void> {
+    if (document.visibilityState !== "hidden" || runState !== "running" || renewing) return;
+
+    clearRenewTimer();
+    if (animationFrame) cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
+
+    try {
+      await commitPositions();
+    } catch (error) {
+      console.error("Could not commit positions while panel was hidden:", error);
+    } finally {
+      closeInteraction();
+      currentSpeed = 0;
+      currentSpeedValue.textContent = "0";
+      runState = "paused";
+      updateRunButtons();
+      status.textContent = "Paused because the Minecart Scroll panel was hidden. Press Resume to continue.";
+    }
+  }
+
+  window.addEventListener("pagehide", cleanupInteractionForPageExit);
+  window.addEventListener("beforeunload", cleanupInteractionForPageExit);
+  document.addEventListener("visibilitychange", () => void pauseForHiddenPanel());
 
   function scheduleRenewal(): void {
     clearRenewTimer();
@@ -819,6 +868,7 @@ OBR.onReady(async () => {
     if (runState === "stopped" || renewing) return;
     clearRenewTimer();
     cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
 
     if (runState === "running") await commitPositions();
     closeInteraction();
@@ -831,6 +881,22 @@ OBR.onReady(async () => {
     runState = "stopped";
     updateRunButtons();
     status.textContent = "Stopped. Start will rebuild the chase at the anchor.";
+  });
+
+  emergencyResetButton.addEventListener("click", () => {
+    clearRenewTimer();
+    if (animationFrame) cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
+    closeInteraction();
+    renewing = false;
+    currentSpeed = 0;
+    currentSpeedValue.textContent = "0";
+    activeTrack = null;
+    activeBackground = null;
+    activeForeground = null;
+    runState = "stopped";
+    updateRunButtons();
+    status.textContent = "Emergency reset complete. Current interaction stopped; saved settings were kept.";
   });
 
   updateLayerLabels();
