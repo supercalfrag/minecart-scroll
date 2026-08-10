@@ -392,7 +392,6 @@ async function runControllerBackground(): Promise<void> {
         if (command.type === "START") {
           const settings = parseSavedSettings(command.settings);
           if (!settings) throw new Error("Invalid chase settings.");
-          await ensureAssignedSourcesVisible();
           await prepareSources(settings);
           const revision = (current?.revision ?? 0) + 1;
           const now = Date.now();
@@ -479,7 +478,7 @@ async function runControllerBackground(): Promise<void> {
         }
 
         if (command.type === "SET_TARGET_SPEED") {
-          const targetSpeed = clampNumber(command.value, 0, 750, current.motion.targetSpeed);
+          const targetSpeed = clampNumber(command.value, 0, 1000, current.motion.targetSpeed);
           await writeRuntime({
             ...current,
             revision: current.revision + 1,
@@ -954,8 +953,157 @@ async function runUI(): Promise<void> {
     status.textContent = `${kind[0].toUpperCase()}${kind.slice(1)} layer set.`;
   }
 
-  async function sendCommand(command: ControlCommand): Promise<void> {
-    await OBR.broadcast.sendMessage(CONTROL_CHANNEL, command, { destination: "LOCAL" });
+  async function applyCommandDirect(command: ControlCommand): Promise<void> {
+    if (!(await OBR.scene.isReady())) {
+      status.textContent = "Open a scene first.";
+      return;
+    }
+
+    try {
+      const current = await readRuntime();
+      const now = Date.now();
+
+      if (command.type === "START") {
+        const settings = parseSavedSettings(command.settings);
+        if (!settings) throw new Error("Invalid chase settings.");
+
+        await prepareSources(settings);
+
+        const next: RuntimeState = {
+          version: 3,
+          revision: (current?.revision ?? 0) + 1,
+          runState: "running",
+          controllerId: OBR.player.id,
+          trackIds: [...settings.trackIds],
+          backgroundIds: [...settings.backgroundIds],
+          foregroundIds: [...settings.foregroundIds],
+          backgroundMultiplier: settings.backgroundMultiplier,
+          foregroundMultiplier: settings.foregroundMultiplier,
+          motion: {
+            segmentStartMs: now,
+            distanceAtSegmentStart: 0,
+            speedAtSegmentStart: 0,
+            targetSpeed: settings.targetSpeed,
+            acceleration: settings.acceleration,
+          },
+        };
+
+        await writeRuntime(next);
+        runtime = next;
+        updateButtons();
+        status.textContent = "Chase started.";
+        return;
+      }
+
+      if (!current || current.runState === "stopped") {
+        throw new Error("No active chase.");
+      }
+
+      const snapshot =
+        current.runState === "running"
+          ? motionAt(current.motion, now)
+          : { distance: current.motion.distanceAtSegmentStart, speed: 0 };
+
+      if (command.type === "PAUSE") {
+        if (current.runState !== "running") return;
+        const next: RuntimeState = {
+          ...current,
+          revision: current.revision + 1,
+          runState: "paused",
+          motion: {
+            ...current.motion,
+            segmentStartMs: now,
+            distanceAtSegmentStart: snapshot.distance,
+            speedAtSegmentStart: 0,
+          },
+        };
+        await writeRuntime(next);
+        runtime = next;
+        updateButtons();
+        status.textContent = "Paused — positions preserved.";
+        return;
+      }
+
+      if (command.type === "RESUME") {
+        if (current.runState !== "paused") return;
+        const next: RuntimeState = {
+          ...current,
+          revision: current.revision + 1,
+          runState: "running",
+          motion: {
+            ...current.motion,
+            segmentStartMs: now,
+            distanceAtSegmentStart: current.motion.distanceAtSegmentStart,
+            speedAtSegmentStart: 0,
+          },
+        };
+        await writeRuntime(next);
+        runtime = next;
+        updateButtons();
+        status.textContent = "Resumed.";
+        return;
+      }
+
+      if (command.type === "STOP") {
+        const finalDistance =
+          current.runState === "running" ? snapshot.distance : current.motion.distanceAtSegmentStart;
+
+        await commitSourcesAtDistance(current, finalDistance);
+
+        const next: RuntimeState = {
+          ...current,
+          revision: current.revision + 1,
+          runState: "stopped",
+          motion: {
+            ...current.motion,
+            segmentStartMs: now,
+            distanceAtSegmentStart: finalDistance,
+            speedAtSegmentStart: 0,
+          },
+        };
+        await writeRuntime(next);
+        runtime = next;
+        updateButtons();
+        status.textContent = "Chase stopped.";
+        return;
+      }
+
+      if (command.type === "SET_TARGET_SPEED") {
+        const next: RuntimeState = {
+          ...current,
+          revision: current.revision + 1,
+          motion: {
+            ...current.motion,
+            segmentStartMs: now,
+            distanceAtSegmentStart: snapshot.distance,
+            speedAtSegmentStart: current.runState === "running" ? snapshot.speed : 0,
+            targetSpeed: clampNumber(command.value, 0, 1000, current.motion.targetSpeed),
+          },
+        };
+        await writeRuntime(next);
+        runtime = next;
+        return;
+      }
+
+      if (command.type === "SET_ACCELERATION") {
+        const next: RuntimeState = {
+          ...current,
+          revision: current.revision + 1,
+          motion: {
+            ...current.motion,
+            segmentStartMs: now,
+            distanceAtSegmentStart: snapshot.distance,
+            speedAtSegmentStart: current.runState === "running" ? snapshot.speed : 0,
+            acceleration: clampNumber(command.value, 25, 1000, current.motion.acceleration),
+          },
+        };
+        await writeRuntime(next);
+        runtime = next;
+      }
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "Minecart Scroll command failed.";
+      console.error("Minecart Scroll command failed:", error);
+    }
   }
 
   async function goToAnchor(): Promise<void> {
@@ -984,14 +1132,14 @@ async function runUI(): Promise<void> {
   targetSpeedSlider.addEventListener("input", () => {
     targetSpeedValue.textContent = targetSpeedSlider.value;
     if (currentState() !== "stopped") {
-      void sendCommand({ type: "SET_TARGET_SPEED", value: Number(targetSpeedSlider.value) });
+      void applyCommandDirect({ type: "SET_TARGET_SPEED", value: Number(targetSpeedSlider.value) });
     }
   });
 
   accelerationSlider.addEventListener("input", () => {
     accelerationValue.textContent = accelerationSlider.value;
     if (currentState() !== "stopped") {
-      void sendCommand({ type: "SET_ACCELERATION", value: Number(accelerationSlider.value) });
+      void applyCommandDirect({ type: "SET_ACCELERATION", value: Number(accelerationSlider.value) });
     }
   });
 
@@ -1010,12 +1158,11 @@ async function runUI(): Promise<void> {
     }
     if (settings.focusOnStart) await goToAnchor();
     await OBR.player.deselect();
-    await sendCommand({ type: "START", settings });
-    status.textContent = "Starting chase...";
+    await applyCommandDirect({ type: "START", settings });
   });
-  pauseButton.addEventListener("click", () => void sendCommand({ type: "PAUSE" }));
-  resumeButton.addEventListener("click", () => void sendCommand({ type: "RESUME" }));
-  stopButton.addEventListener("click", () => void sendCommand({ type: "STOP" }));
+  pauseButton.addEventListener("click", () => void applyCommandDirect({ type: "PAUSE" }));
+  resumeButton.addEventListener("click", () => void applyCommandDirect({ type: "RESUME" }));
+  stopButton.addEventListener("click", () => void applyCommandDirect({ type: "STOP" }));
 
   OBR.broadcast.onMessage(STATUS_CHANNEL, (event) => {
     const message = event.data as StatusMessage;
@@ -1055,47 +1202,17 @@ async function runUI(): Promise<void> {
 }
 
 
-async function ensureAssignedSourcesVisible(): Promise<void> {
-  // Minecart Scroll never hides scene source items anymore. This also repairs items
-  // left hidden by older v0.4 builds, including Floor and Minecart assignments.
-  await cleanupLocalClones();
-
-  if (!(await OBR.scene.isReady())) return;
-
-  const metadata = await OBR.scene.getMetadata();
-  const ids = new Set<string>();
-  const assignmentKeys = ["floorIds", "backgroundIds", "trackIds", "minecartIds", "foregroundIds"];
-
-  for (const raw of [metadata[SETTINGS_KEY], metadata[RUNTIME_KEY]]) {
-    if (!raw || typeof raw !== "object") continue;
-    const record = raw as Record<string, unknown>;
-    for (const key of assignmentKeys) {
-      const value = record[key];
-      if (!Array.isArray(value)) continue;
-      for (const id of value) {
-        if (typeof id === "string") ids.add(id);
-      }
-    }
-  }
-
-  if (ids.size === 0) return;
-  const items = await OBR.scene.items.getItems([...ids]);
-  if (items.length === 0) return;
-
-  await OBR.scene.items.updateItems(items, (draft) => {
-    for (const item of draft) item.visible = true;
-  });
-}
-
 const backgroundMode = new URLSearchParams(window.location.search).get("background") === "1";
 
 if (backgroundMode) {
   OBR.onReady(() => {
-    void (async () => {
-      await ensureAssignedSourcesVisible();
-      await runLocalRendererBackground();
-      await runControllerBackground();
-    })();
+    // Start renderer and legacy control listener independently so one cannot block the other.
+    void runLocalRendererBackground().catch((error) =>
+      console.error("Minecart Scroll background renderer failed to start:", error),
+    );
+    void runControllerBackground().catch((error) =>
+      console.error("Minecart Scroll background controller failed to start:", error),
+    );
   });
 } else {
   renderUI();
