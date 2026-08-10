@@ -9,6 +9,7 @@ const STATUS_CHANNEL = "com.supercalfrag.minecart-scroll/status";
 const TRACK_OVERLAP = 2;
 const TRACK_Z_GAP = 100000;
 const FOREGROUND_Z_GAP = 200000;
+const LOCAL_CLONE_Z_OFFSET = 50000; // Keep animated local copies above stationary source art.
 const LOCAL_TICK_MS = 20; // 50fps target. Absolute-time motion prevents cumulative drift.
 
 type RunState = "stopped" | "running" | "paused";
@@ -215,7 +216,7 @@ function cloneImageForLocal(source: Image): Image {
     .rotation(source.rotation)
     .scale({ ...source.scale })
     .layer(source.layer)
-    .zIndex(source.zIndex)
+    .zIndex(source.zIndex + LOCAL_CLONE_Z_OFFSET)
     .visible(true)
     .locked(true)
     .disableHit(true)
@@ -536,7 +537,7 @@ async function makeLocalLayer(kind: LayerKind, ids: string[], multiplier: number
     startX: images[0].position.x,
     y: images[0].position.y,
     spacing,
-    baseZ: images[0].zIndex,
+    baseZ: images[0].zIndex + LOCAL_CLONE_Z_OFFSET,
     multiplier,
     lastOrderSignature: "",
     zQueue: Promise.resolve(),
