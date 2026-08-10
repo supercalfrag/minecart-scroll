@@ -856,10 +856,6 @@ OBR.onReady(async () => {
       cart.lastWrittenX = item.position.x;
       cart.lastWrittenY = item.position.y;
 
-      if (selectedItemIds.has(item.id)) {
-        // Clear the selection after a completed move so this cart can resume rattling.
-        void OBR.player.deselect([item.id]);
-      }
     }
   });
 
