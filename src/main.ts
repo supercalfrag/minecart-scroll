@@ -6,6 +6,7 @@ const FLOOR_Z_GAP = 100000;
 const TRACK_Z_GAP = 100000;
 const FOREGROUND_Z_GAP = 200000;
 const INTERACTION_RENEW_MS = 20000;
+const MINECART_UPDATE_INTERVAL_MS = 50;
 
 type RunState = "stopped" | "running" | "paused";
 
@@ -29,6 +30,8 @@ type MinecartRattleState = {
   frequencyB: number;
   amplitudeScale: number;
   offsetY: number;
+  lastWrittenX: number;
+  lastWrittenY: number;
 };
 
 type MinecartRattleGroup = {
@@ -305,6 +308,9 @@ OBR.onReady(async () => {
   let activeBackground: LoopLayer | null = null;
   let activeForeground: LoopLayer | null = null;
   let activeMinecarts: MinecartRattleGroup | null = null;
+  let selectedItemIds = new Set<string>();
+  let minecartWriteInFlight = false;
+  let lastMinecartWriteTime = 0;
 
   type InteractionManager = Awaited<ReturnType<typeof OBR.interaction.startItemInteraction>>;
   let interactionUpdate: InteractionManager[0] | null = null;
@@ -660,6 +666,8 @@ OBR.onReady(async () => {
         frequencyB: 7 + seededUnit(`${image.id}:freqB`) * 4,
         amplitudeScale: 0.75 + seededUnit(`${image.id}:amp`) * 0.5,
         offsetY: 0,
+        lastWrittenX: image.position.x,
+        lastWrittenY: image.position.y,
       });
     }
     return { images, states };
@@ -772,9 +780,9 @@ OBR.onReady(async () => {
   }
 
   function getActiveImages(): Image[] {
-    const scrolling = getActiveLayers().flatMap((layer) => layer.images);
-    const carts = activeMinecarts?.images ?? [];
-    return [...scrolling, ...carts];
+    // Minecarts deliberately stay out of the long-running interaction so Owlbear
+    // can keep them draggable while the chase is running.
+    return getActiveLayers().flatMap((layer) => layer.images);
   }
 
   function layerForItem(id: string): LoopLayer | null {
@@ -800,11 +808,7 @@ OBR.onReady(async () => {
           continue;
         }
 
-        const cart = activeMinecarts?.states.get(item.id);
-        if (cart) {
-          item.position.x = cart.baseX;
-          item.position.y = cart.baseY + cart.offsetY;
-        }
+
       }
     });
   }
@@ -818,10 +822,78 @@ OBR.onReady(async () => {
         const cart = states.get(item.id);
         if (!cart) continue;
         cart.offsetY = 0;
+        cart.lastWrittenX = cart.baseX;
+        cart.lastWrittenY = cart.baseY;
         item.position.x = cart.baseX;
         item.position.y = cart.baseY;
       }
     });
+  }
+
+  selectedItemIds = new Set((await OBR.player.getSelection()) ?? []);
+
+  OBR.player.onChange((player) => {
+    selectedItemIds = new Set(player.selection ?? []);
+  });
+
+  OBR.scene.items.onChange((items) => {
+    if (!activeMinecarts) return;
+
+    for (const item of items) {
+      const cart = activeMinecarts.states.get(item.id);
+      if (!cart || !isImage(item)) continue;
+
+      const matchesLastWrite =
+        Math.abs(item.position.x - cart.lastWrittenX) < 0.01 &&
+        Math.abs(item.position.y - cart.lastWrittenY) < 0.01;
+      if (matchesLastWrite) continue;
+
+      // A player (or another extension) moved the cart. Treat the dropped
+      // position as its new resting point, then let the rattle continue around it.
+      cart.baseX = item.position.x;
+      cart.baseY = item.position.y;
+      cart.offsetY = 0;
+      cart.lastWrittenX = item.position.x;
+      cart.lastWrittenY = item.position.y;
+
+      if (selectedItemIds.has(item.id)) {
+        // Clear the selection after a completed move so this cart can resume rattling.
+        void OBR.player.deselect([item.id]);
+      }
+    }
+  });
+
+  function pushMinecartRattle(timeMs: number): void {
+    if (!activeMinecarts || minecartWriteInFlight) return;
+    if (timeMs - lastMinecartWriteTime < MINECART_UPDATE_INTERVAL_MS) return;
+
+    lastMinecartWriteTime = timeMs;
+    minecartWriteInFlight = true;
+    const images = activeMinecarts.images;
+    const states = activeMinecarts.states;
+
+    void OBR.scene.items
+      .updateItems(images, (items) => {
+        for (const item of items) {
+          const cart = states.get(item.id);
+          if (!cart) continue;
+
+          // While a cart is selected, leave it completely alone so Owlbear's
+          // normal pointer tool can drag it without fighting the rattle.
+          if (selectedItemIds.has(item.id)) continue;
+
+          const x = cart.baseX;
+          const y = cart.baseY + cart.offsetY;
+          cart.lastWrittenX = x;
+          cart.lastWrittenY = y;
+          item.position.x = x;
+          item.position.y = y;
+        }
+      })
+      .catch((error) => console.error("Minecart rattle update failed:", error))
+      .finally(() => {
+        minecartWriteInFlight = false;
+      });
   }
 
   function closeInteraction(): void {
@@ -961,6 +1033,7 @@ OBR.onReady(async () => {
     if (activeBackground) moveLayer(activeBackground, deltaTime, backgroundMultiplier);
     if (activeForeground) moveLayer(activeForeground, deltaTime, foregroundMultiplier);
     updateMinecartRattle(time / 1000);
+    pushMinecartRattle(time);
 
     if (interactionUpdate) {
       interactionUpdate((draft) => {
@@ -975,11 +1048,7 @@ OBR.onReady(async () => {
             continue;
           }
 
-          const cart = activeMinecarts?.states.get(item.id);
-          if (cart) {
-            item.position.x = cart.baseX;
-            item.position.y = cart.baseY + cart.offsetY;
-          }
+
         }
       });
     }
@@ -1052,6 +1121,8 @@ OBR.onReady(async () => {
     }
 
     activeMinecarts = prepareMinecarts(minecartImages);
+    minecartWriteInFlight = false;
+    lastMinecartWriteTime = 0;
   }
 
   startButton.addEventListener("click", async () => {
