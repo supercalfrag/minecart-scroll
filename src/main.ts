@@ -265,7 +265,7 @@ OBR.onReady(async () => {
   }
 
   function applyTargetSpeed(value: number): void {
-    targetSpeed = clampNumber(value, 0, 750, 150);
+    targetSpeed = clampNumber(value, 0, 1000, 150);
     targetSpeedSlider.value = String(targetSpeed);
     targetSpeedValue.textContent = String(Math.round(targetSpeed));
   }
@@ -397,7 +397,7 @@ OBR.onReady(async () => {
       foregroundYOffset: clampNumber(Number(value.foregroundYOffset), -10000, 10000, 0),
       backgroundOverlap: clampNumber(Number(value.backgroundOverlap), 0, 50, 0),
       foregroundOverlap: clampNumber(Number(value.foregroundOverlap), 0, 50, 0),
-      targetSpeed: clampNumber(Number(value.targetSpeed), 0, 750, 150),
+      targetSpeed: clampNumber(Number(value.targetSpeed), 0, 1000, 150),
       acceleration: clampNumber(Number(value.acceleration), 25, 1000, 200),
       backgroundMultiplier: clampNumber(Number(value.backgroundMultiplier), 0, 1, 0.4),
       foregroundMultiplier: clampNumber(Number(value.foregroundMultiplier), 1, 2.5, 1.4),
