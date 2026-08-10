@@ -848,9 +848,13 @@ OBR.onReady(async () => {
 
   async function openMinecartInteraction(): Promise<void> {
     closeMinecartInteraction();
-    if (!activeMinecarts || minecartRattleSuspended || runState !== "running") return;
+    if (!activeMinecarts || runState !== "running") return;
 
-    const ids = activeMinecarts.images.map((image) => image.id);
+    // Keep every unselected cart rattling. The cart currently being moved is
+    // deliberately excluded so Owlbear's normal drag/keyboard controls own it.
+    const ids = activeMinecarts.images
+      .map((image) => image.id)
+      .filter((id) => id !== draggedMinecartId);
     if (ids.length === 0) return;
     const refreshed = await OBR.scene.items.getItems(ids);
     const refreshedImages = refreshed.filter(isImage);
@@ -904,6 +908,9 @@ OBR.onReady(async () => {
           minecartRattleSuspended = true;
           clearMinecartDropTimer();
           closeMinecartInteraction();
+          void openMinecartInteraction().catch((error) =>
+            console.error("Could not keep other minecarts rattling:", error),
+          );
 
           const cart = activeMinecarts.states.get(id)!;
           lastObservedMinecartX = cart.baseX;
@@ -1031,7 +1038,7 @@ OBR.onReady(async () => {
       closeMinecartInteraction();
       if (runState === "running") {
         await openInteraction();
-        if (!minecartRattleSuspended) await openMinecartInteraction();
+        await openMinecartInteraction();
         lastTime = performance.now();
         animationFrame = requestAnimationFrame(animate);
         scheduleRenewal();
@@ -1105,10 +1112,11 @@ OBR.onReady(async () => {
       });
     }
 
-    if (minecartInteractionUpdate && activeMinecarts && !minecartRattleSuspended) {
+    if (minecartInteractionUpdate && activeMinecarts) {
       minecartInteractionUpdate((draft) => {
         const items = Array.isArray(draft) ? draft : [draft];
         for (const item of items) {
+          if (item.id === draggedMinecartId) continue;
           const cart = activeMinecarts?.states.get(item.id);
           if (!cart) continue;
           item.position.x = cart.baseX;
