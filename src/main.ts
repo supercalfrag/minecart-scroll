@@ -955,21 +955,37 @@ OBR.onReady(async () => {
     }
   }
 
-  async function openMinecartInteraction(): Promise<void> {
-    closeMinecartInteraction();
-    if (!activeMinecarts || runState !== "running") return;
+  async function createMinecartInteraction(): Promise<InteractionManager | null> {
+    if (!activeMinecarts || runState !== "running") return null;
 
     // Keep every unselected cart rattling. The cart currently being moved is
     // deliberately excluded so Owlbear's normal drag/keyboard controls own it.
     const ids = activeMinecarts.images
       .map((image) => image.id)
       .filter((id) => id !== draggedMinecartId);
-    if (ids.length === 0) return;
+    if (ids.length === 0) return null;
+
     const refreshed = await OBR.scene.items.getItems(ids);
     const refreshedImages = refreshed.filter(isImage);
     if (refreshedImages.length !== ids.length) throw new Error("One or more minecart images disappeared from the scene.");
 
-    const interaction = await OBR.interaction.startItemInteraction(refreshedImages);
+    // Start replacement interactions from the exact current visual position,
+    // not the older committed scene position. This keeps cast-device handoffs
+    // from jumping backwards when an interaction is renewed.
+    for (const image of refreshedImages) {
+      const cart = activeMinecarts.states.get(image.id);
+      if (!cart) continue;
+      image.position.x = cart.baseX;
+      image.position.y = cart.baseY + cart.offsetY;
+    }
+
+    return OBR.interaction.startItemInteraction(refreshedImages);
+  }
+
+  async function openMinecartInteraction(): Promise<void> {
+    closeMinecartInteraction();
+    const interaction = await createMinecartInteraction();
+    if (!interaction) return;
     minecartInteractionUpdate = interaction[0];
     minecartInteractionStop = interaction[1];
   }
@@ -1075,17 +1091,30 @@ OBR.onReady(async () => {
     }
   }
 
-  async function openInteraction(): Promise<void> {
-    // Defensive cleanup: this instance must never own two interactions at once.
-    closeInteraction();
-
+  async function createScrollInteraction(): Promise<InteractionManager> {
     const activeImages = getActiveImages();
     const ids = activeImages.map((image) => image.id);
     const refreshed = await OBR.scene.items.getItems(ids);
     const refreshedImages = refreshed.filter(isImage);
     if (refreshedImages.length !== ids.length) throw new Error("One or more scrolling images disappeared from the scene.");
 
-    const interaction = await OBR.interaction.startItemInteraction(refreshedImages);
+    // Seed the interaction with the engine's current in-memory positions.
+    // The scene's committed positions can be older while a chase is running.
+    for (const image of refreshedImages) {
+      const layer = layerForItem(image.id);
+      if (!layer) continue;
+      const x = layer.positions.get(image.id);
+      if (x !== undefined) image.position.x = x;
+      image.position.y = layer.y;
+    }
+
+    return OBR.interaction.startItemInteraction(refreshedImages);
+  }
+
+  async function openInteraction(): Promise<void> {
+    // Defensive cleanup: this instance must never own two interactions at once.
+    closeInteraction();
+    const interaction = await createScrollInteraction();
     interactionUpdate = interaction[0];
     interactionStop = interaction[1];
   }
@@ -1140,26 +1169,69 @@ OBR.onReady(async () => {
     if (runState !== "running" || renewing) return;
     renewing = true;
     updateRunButtons();
+
+    // Keep the current interactions alive while their replacements are created.
+    // Owlbear interactions expire for network traffic after 30 seconds, but
+    // stopping animation and committing the whole scene during renewal caused
+    // visible gaps on cast/remote clients. The new interaction is started first
+    // from the current in-memory positions, then the old one is retired.
+    const oldScrollStop = interactionStop;
+    const oldMinecartStop = minecartInteractionStop;
+    let nextScroll: InteractionManager | null = null;
+    let nextMinecart: InteractionManager | null = null;
+
     try {
-      cancelAnimationFrame(animationFrame);
-      await commitPositions();
-      closeInteraction();
-      closeMinecartInteraction();
-      if (runState === "running") {
-        await openInteraction();
-        await openMinecartInteraction();
-        lastTime = performance.now();
-        animationFrame = requestAnimationFrame(animate);
-        scheduleRenewal();
+      nextScroll = await createScrollInteraction();
+      nextMinecart = await createMinecartInteraction();
+
+      if (runState !== "running") {
+        nextScroll[1]();
+        nextMinecart?.[1]();
+        return;
       }
+
+      interactionUpdate = nextScroll[0];
+      interactionStop = nextScroll[1];
+
+      if (nextMinecart) {
+        minecartInteractionUpdate = nextMinecart[0];
+        minecartInteractionStop = nextMinecart[1];
+      } else {
+        minecartInteractionUpdate = null;
+        minecartInteractionStop = null;
+      }
+
+      // Only after the replacement streams are live do we stop the old streams.
+      // This avoids an interpolation gap for cast devices.
+      try {
+        oldScrollStop?.();
+      } catch (error) {
+        console.error("Could not retire previous scrolling interaction:", error);
+      }
+      try {
+        oldMinecartStop?.();
+      } catch (error) {
+        console.error("Could not retire previous minecart interaction:", error);
+      }
+
+      scheduleRenewal();
     } catch (error) {
-      console.error("Interaction renewal failed:", error);
-      closeInteraction();
-      closeMinecartInteraction();
-      currentSpeed = 0;
-      currentSpeedValue.textContent = "0.0";
-      runState = "paused";
-      status.textContent = "Network sync renewal failed; chase paused safely. Press Resume to retry.";
+      console.error("Seamless interaction renewal failed:", error);
+
+      // A partially-created replacement must not compete with the still-live
+      // old interaction. Keep the old stream running and retry shortly.
+      try {
+        nextScroll?.[1]();
+      } catch {}
+      try {
+        nextMinecart?.[1]();
+      } catch {}
+
+      if (runState === "running") {
+        clearRenewTimer();
+        renewTimer = window.setTimeout(() => void renewInteraction(), 3000);
+        status.textContent = "Cast sync renewal delayed; chase is still running and will retry automatically.";
+      }
     } finally {
       renewing = false;
       updateRunButtons();
