@@ -156,13 +156,14 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 
       <fieldset>
         <legend><strong>Motion</strong></legend>
-        <label>Main Target Speed: <strong><span id="targetSpeedValue">150</span></strong></label>
-        <input id="targetSpeedSlider" type="range" min="0" max="1000" value="150" step="25" style="width:100%;">
+        <label>Main Target Speed: <strong><span id="targetSpeedValue">—</span> ft/s</strong></label>
+        <input id="targetSpeedSlider" type="range" min="0" max="100" value="0" step="0.5" style="width:100%;">
 
-        <p style="margin:8px 0;">Current Speed: <strong><span id="currentSpeedValue">0</span></strong></p>
+        <p style="margin:8px 0;">Current Speed: <strong><span id="currentSpeedValue">0.0</span> ft/s</strong></p>
 
-        <label>Acceleration / Braking: <strong><span id="accelerationValue">200</span></strong></label>
-        <input id="accelerationSlider" type="range" min="25" max="1000" value="200" step="25" style="width:100%;">
+        <label>Acceleration / Braking: <strong><span id="accelerationValue">—</span> ft/s²</strong></label>
+        <input id="accelerationSlider" type="range" min="0" max="100" value="0" step="0.5" style="width:100%;">
+        <p id="speedScaleValue" style="font-size:12px; margin:6px 0 0;">Reading Owlbear grid scale...</p>
 
         <br><br>
         <label>Floor Speed: <strong><span id="floorMultiplierValue">45</span>%</strong></label>
@@ -189,8 +190,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <label>Rattle Strength: <strong><span id="rattleStrengthValue">100</span>%</strong></label>
         <input id="rattleStrengthSlider" type="range" min="0" max="200" value="100" step="10" style="width:100%;">
         <br><br>
-        <label>Rattle Starts At Speed:
-          <input id="rattleStartSpeedInput" type="number" min="0" max="1000" value="100" step="25" style="width:80px;">
+        <label>Rattle Starts At:
+          <input id="rattleStartSpeedInput" type="number" min="0" max="100" value="0" step="0.5" style="width:80px;"> ft/s
         </label>
       </fieldset>
 
@@ -258,6 +259,7 @@ OBR.onReady(async () => {
   const currentSpeedValue = document.querySelector<HTMLSpanElement>("#currentSpeedValue")!;
   const accelerationSlider = document.querySelector<HTMLInputElement>("#accelerationSlider")!;
   const accelerationValue = document.querySelector<HTMLSpanElement>("#accelerationValue")!;
+  const speedScaleValue = document.querySelector<HTMLParagraphElement>("#speedScaleValue")!;
   const floorMultiplierSlider = document.querySelector<HTMLInputElement>("#floorMultiplierSlider")!;
   const floorMultiplierValue = document.querySelector<HTMLSpanElement>("#floorMultiplierValue")!;
   const backgroundMultiplierSlider = document.querySelector<HTMLInputElement>("#backgroundMultiplierSlider")!;
@@ -300,6 +302,12 @@ OBR.onReady(async () => {
   let rattleStrength = 1;
   let rattleStartSpeed = 100;
 
+  // The scrolling engine continues to use Owlbear scene units/second internally.
+  // The UI converts those values to real feet/second using the current scene grid.
+  let sceneGridDpi = 150;
+  let feetPerGridCell = 5;
+  let speedScaleReady = false;
+
   let runState: RunState = "stopped";
   let activeFloor: LoopLayer | null = null;
   let activeTrack: LoopLayer | null = null;
@@ -330,6 +338,94 @@ OBR.onReady(async () => {
     return Math.max(min, Math.min(max, value));
   }
 
+  function gridUnitToFeet(unit: string): number | null {
+    const normalized = unit.trim().toLowerCase();
+    if (["ft", "foot", "feet"].includes(normalized)) return 1;
+    if (["in", "inch", "inches"].includes(normalized)) return 1 / 12;
+    if (["yd", "yard", "yards"].includes(normalized)) return 3;
+    if (["mi", "mile", "miles"].includes(normalized)) return 5280;
+    if (["m", "meter", "meters", "metre", "metres"].includes(normalized)) return 3.280839895;
+    if (["cm", "centimeter", "centimeters", "centimetre", "centimetres"].includes(normalized)) return 0.03280839895;
+    if (["mm", "millimeter", "millimeters", "millimetre", "millimetres"].includes(normalized)) return 0.003280839895;
+    if (["km", "kilometer", "kilometers", "kilometre", "kilometres"].includes(normalized)) return 3280.839895;
+    return null;
+  }
+
+  function internalSpeedToFeetPerSecond(value: number): number {
+    if (!speedScaleReady || sceneGridDpi <= 0) return 0;
+    return (value * feetPerGridCell) / sceneGridDpi;
+  }
+
+  function feetPerSecondToInternalSpeed(value: number): number {
+    if (!speedScaleReady || feetPerGridCell <= 0) return 0;
+    return (value * sceneGridDpi) / feetPerGridCell;
+  }
+
+  function formatFeetPerSecondFromInternal(value: number): string {
+    return internalSpeedToFeetPerSecond(value).toFixed(1);
+  }
+
+  function speedUiStep(maxFeetPerSecond: number): number {
+    if (maxFeetPerSecond <= 10) return 0.1;
+    if (maxFeetPerSecond <= 50) return 0.5;
+    return 1;
+  }
+
+  function configureSpeedControlRanges(): void {
+    if (!speedScaleReady) return;
+
+    const maxFeetPerSecond = internalSpeedToFeetPerSecond(1000);
+    const minAccelerationFeetPerSecondSquared = internalSpeedToFeetPerSecond(25);
+    const step = speedUiStep(maxFeetPerSecond);
+
+    targetSpeedSlider.min = "0";
+    targetSpeedSlider.max = String(maxFeetPerSecond);
+    targetSpeedSlider.step = String(step);
+
+    accelerationSlider.min = String(minAccelerationFeetPerSecondSquared);
+    accelerationSlider.max = String(maxFeetPerSecond);
+    accelerationSlider.step = String(step);
+
+    rattleStartSpeedInput.min = "0";
+    rattleStartSpeedInput.max = String(maxFeetPerSecond);
+    rattleStartSpeedInput.step = String(step);
+  }
+
+  function renderSpeedControls(): void {
+    if (!speedScaleReady) return;
+
+    configureSpeedControlRanges();
+    targetSpeedSlider.value = String(internalSpeedToFeetPerSecond(targetSpeed));
+    targetSpeedValue.textContent = formatFeetPerSecondFromInternal(targetSpeed);
+    currentSpeedValue.textContent = formatFeetPerSecondFromInternal(currentSpeed);
+    accelerationSlider.value = String(internalSpeedToFeetPerSecond(acceleration));
+    accelerationValue.textContent = formatFeetPerSecondFromInternal(acceleration);
+    rattleStartSpeedInput.value = String(internalSpeedToFeetPerSecond(rattleStartSpeed));
+  }
+
+  async function refreshSceneSpeedScale(): Promise<void> {
+    if (!(await OBR.scene.isReady())) {
+      speedScaleReady = false;
+      speedScaleValue.textContent = "Open a scene to calculate ft/s from the grid scale.";
+      return;
+    }
+
+    const [dpi, scale] = await Promise.all([OBR.scene.grid.getDpi(), OBR.scene.grid.getScale()]);
+    const unitFeet = gridUnitToFeet(scale.parsed.unit);
+
+    if (!Number.isFinite(dpi) || dpi <= 0 || !Number.isFinite(scale.parsed.multiplier) || scale.parsed.multiplier <= 0 || unitFeet === null) {
+      speedScaleReady = false;
+      speedScaleValue.textContent = `Cannot convert grid scale "${scale.raw}" to feet. Use a distance unit such as ft, in, yd, mi, m, cm, mm, or km.`;
+      return;
+    }
+
+    sceneGridDpi = dpi;
+    feetPerGridCell = scale.parsed.multiplier * unitFeet;
+    speedScaleReady = true;
+    speedScaleValue.textContent = `Scene scale: ${feetPerGridCell.toFixed(2).replace(/\.?0+$/, "")} ft/grid @ ${Math.round(sceneGridDpi)} units/grid`;
+    renderSpeedControls();
+  }
+
   function readControls(): void {
     anchorX = Number.isFinite(Number(anchorXInput.value)) ? Number(anchorXInput.value) : 0;
     anchorY = Number.isFinite(Number(anchorYInput.value)) ? Number(anchorYInput.value) : 0;
@@ -341,7 +437,7 @@ OBR.onReady(async () => {
     foregroundOverlap = clampNumber(Number(foregroundOverlapInput.value), 0, 50, 0);
     rattleEnabled = rattleEnabledCheckbox.checked;
     rattleStrength = clampNumber(Number(rattleStrengthSlider.value), 0, 200, 100) / 100;
-    rattleStartSpeed = clampNumber(Number(rattleStartSpeedInput.value), 0, 1000, 100);
+    rattleStartSpeed = clampNumber(feetPerSecondToInternalSpeed(Number(rattleStartSpeedInput.value)), 0, 1000, 100);
   }
 
   function updateLayerLabels(): void {
@@ -367,14 +463,26 @@ OBR.onReady(async () => {
 
   function applyTargetSpeed(value: number): void {
     targetSpeed = clampNumber(value, 0, 1000, 150);
-    targetSpeedSlider.value = String(targetSpeed);
-    targetSpeedValue.textContent = String(Math.round(targetSpeed));
+    if (speedScaleReady) {
+      targetSpeedSlider.value = String(internalSpeedToFeetPerSecond(targetSpeed));
+      targetSpeedValue.textContent = formatFeetPerSecondFromInternal(targetSpeed);
+    }
+  }
+
+  function applyTargetSpeedFeetPerSecond(value: number): void {
+    applyTargetSpeed(feetPerSecondToInternalSpeed(value));
   }
 
   function applyAcceleration(value: number): void {
     acceleration = clampNumber(value, 25, 1000, 200);
-    accelerationSlider.value = String(acceleration);
-    accelerationValue.textContent = String(Math.round(acceleration));
+    if (speedScaleReady) {
+      accelerationSlider.value = String(internalSpeedToFeetPerSecond(acceleration));
+      accelerationValue.textContent = formatFeetPerSecondFromInternal(acceleration);
+    }
+  }
+
+  function applyAccelerationFeetPerSecondSquared(value: number): void {
+    applyAcceleration(feetPerSecondToInternalSpeed(value));
   }
 
   function applyFloorMultiplier(percent: number): void {
@@ -398,8 +506,8 @@ OBR.onReady(async () => {
     foregroundMultiplierValue.textContent = String(Math.round(value));
   }
 
-  targetSpeedSlider.addEventListener("input", () => applyTargetSpeed(Number(targetSpeedSlider.value)));
-  accelerationSlider.addEventListener("input", () => applyAcceleration(Number(accelerationSlider.value)));
+  targetSpeedSlider.addEventListener("input", () => applyTargetSpeedFeetPerSecond(Number(targetSpeedSlider.value)));
+  accelerationSlider.addEventListener("input", () => applyAccelerationFeetPerSecondSquared(Number(accelerationSlider.value)));
   floorMultiplierSlider.addEventListener("input", () => applyFloorMultiplier(Number(floorMultiplierSlider.value)));
   backgroundMultiplierSlider.addEventListener("input", () => applyBackgroundMultiplier(Number(backgroundMultiplierSlider.value)));
   foregroundMultiplierSlider.addEventListener("input", () => applyForegroundMultiplier(Number(foregroundMultiplierSlider.value)));
@@ -568,11 +676,12 @@ OBR.onReady(async () => {
     rattleEnabledCheckbox.checked = saved.rattleEnabled;
     rattleStrengthSlider.value = String(Math.round(saved.rattleStrength * 100));
     rattleStrengthValue.textContent = String(Math.round(saved.rattleStrength * 100));
-    rattleStartSpeedInput.value = String(saved.rattleStartSpeed);
     focusOnStartCheckbox.checked = saved.focusOnStart;
 
     applyTargetSpeed(saved.targetSpeed);
     applyAcceleration(saved.acceleration);
+    rattleStartSpeed = saved.rattleStartSpeed;
+    if (speedScaleReady) rattleStartSpeedInput.value = String(internalSpeedToFeetPerSecond(rattleStartSpeed));
     applyFloorMultiplier(saved.floorMultiplier * 100);
     applyBackgroundMultiplier(saved.backgroundMultiplier * 100);
     applyForegroundMultiplier(saved.foregroundMultiplier * 100);
@@ -1011,7 +1120,7 @@ OBR.onReady(async () => {
       closeMinecartInteraction();
       await resetMinecarts();
       currentSpeed = 0;
-      currentSpeedValue.textContent = "0";
+      currentSpeedValue.textContent = "0.0";
       runState = "paused";
       updateRunButtons();
       status.textContent = "Paused because the Minecart Scroll panel was hidden. Press Resume to continue.";
@@ -1048,7 +1157,7 @@ OBR.onReady(async () => {
       closeInteraction();
       closeMinecartInteraction();
       currentSpeed = 0;
-      currentSpeedValue.textContent = "0";
+      currentSpeedValue.textContent = "0.0";
       runState = "paused";
       status.textContent = "Network sync renewal failed; chase paused safely. Press Resume to retry.";
     } finally {
@@ -1089,7 +1198,7 @@ OBR.onReady(async () => {
     const deltaTime = Math.min((time - lastTime) / 1000, 0.1);
     lastTime = time;
     currentSpeed = approach(currentSpeed, targetSpeed, acceleration * deltaTime);
-    currentSpeedValue.textContent = String(Math.round(currentSpeed));
+    currentSpeedValue.textContent = speedScaleReady ? formatFeetPerSecondFromInternal(currentSpeed) : "0.0";
 
     if (activeFloor) moveLayer(activeFloor, deltaTime, floorMultiplier);
     if (activeTrack) moveLayer(activeTrack, deltaTime, 1);
@@ -1207,7 +1316,7 @@ OBR.onReady(async () => {
       await OBR.player.deselect();
       if (focusOnStartCheckbox.checked) await goToAnchor();
       currentSpeed = 0;
-      currentSpeedValue.textContent = "0";
+      currentSpeedValue.textContent = "0.0";
       runState = "running";
       await openInteraction();
       await openMinecartInteraction();
@@ -1242,7 +1351,7 @@ OBR.onReady(async () => {
     closeMinecartInteraction();
     await resetMinecarts();
     currentSpeed = 0;
-    currentSpeedValue.textContent = "0";
+    currentSpeedValue.textContent = "0.0";
     runState = "paused";
     updateRunButtons();
     status.textContent = "Paused — positions preserved.";
@@ -1252,7 +1361,7 @@ OBR.onReady(async () => {
     if (runState !== "paused" || renewing) return;
     try {
       currentSpeed = 0;
-      currentSpeedValue.textContent = "0";
+      currentSpeedValue.textContent = "0.0";
       runState = "running";
       await openInteraction();
       await openMinecartInteraction();
@@ -1281,7 +1390,7 @@ OBR.onReady(async () => {
     await resetMinecarts();
 
     currentSpeed = 0;
-    currentSpeedValue.textContent = "0";
+    currentSpeedValue.textContent = "0.0";
     activeFloor = null;
     activeTrack = null;
     activeBackground = null;
@@ -1304,7 +1413,7 @@ OBR.onReady(async () => {
     await resetMinecarts();
     renewing = false;
     currentSpeed = 0;
-    currentSpeedValue.textContent = "0";
+    currentSpeedValue.textContent = "0.0";
     activeFloor = null;
     activeTrack = null;
     activeBackground = null;
@@ -1317,6 +1426,9 @@ OBR.onReady(async () => {
 
   updateLayerLabels();
   updateRunButtons();
+  await refreshSceneSpeedScale();
+  OBR.scene.grid.onChange(() => void refreshSceneSpeedScale());
   await loadSettings(true);
+  renderSpeedControls();
   updateRunButtons();
 });
