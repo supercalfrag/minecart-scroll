@@ -190,8 +190,7 @@ function parseRendererDiagnostic(raw: unknown): RendererDiagnostic | null {
 }
 
 async function readRendererDiagnostic(): Promise<RendererDiagnostic | null> {
-  if (!(await OBR.scene.isReady())) return null;
-  const metadata = await OBR.scene.getMetadata();
+  const metadata = await OBR.player.getMetadata();
   return parseRendererDiagnostic(metadata[RENDERER_DIAG_KEY]);
 }
 
@@ -259,7 +258,6 @@ async function runLocalSceneryRenderer(): Promise<void> {
   let rendering = false;
   let reportedMovingRevision = -1;
   let reportedErrorRevision = -1;
-  const canReportDiagnostics = (await OBR.player.getRole()) === "GM";
 
   async function reportDiagnostic(
     revision: number,
@@ -267,7 +265,6 @@ async function runLocalSceneryRenderer(): Promise<void> {
     message: string,
     cloneCount = layers.reduce((sum, layer) => sum + layer.clones.length, 0),
   ): Promise<void> {
-    if (!canReportDiagnostics || !(await OBR.scene.isReady())) return;
     const diagnostic: RendererDiagnostic = {
       version: 1,
       revision,
@@ -276,7 +273,10 @@ async function runLocalSceneryRenderer(): Promise<void> {
       atMs: Date.now(),
       message,
     };
-    await OBR.scene.setMetadata({ [RENDERER_DIAG_KEY]: diagnostic });
+    // Diagnostics are client-specific, so keep them on the current player rather
+    // than global scene metadata. This lets the GM popover hear its own background
+    // renderer without cast/player clients racing the diagnostic value.
+    await OBR.player.setMetadata({ [RENDERER_DIAG_KEY]: diagnostic });
   }
 
   async function clearRenderer(): Promise<void> {
@@ -357,7 +357,8 @@ async function runLocalSceneryRenderer(): Promise<void> {
           );
         }
 
-        await OBR.scene.local.updateItems(layer.clones, (items) => {
+        const cloneIds = layer.clones.map((clone) => clone.id);
+        await OBR.scene.local.updateItems(cloneIds, (items) => {
           for (const item of items) {
             const x = xById.get(item.id);
             if (x !== undefined) item.position.x = x;
@@ -414,11 +415,9 @@ async function runLocalSceneryRenderer(): Promise<void> {
 
   await cleanupLocalScenery();
   if (await OBR.scene.isReady()) {
-    if (canReportDiagnostics) {
-      try {
-        await reportDiagnostic(-1, "boot", "Background renderer is loaded and ready.", 0);
-      } catch {}
-    }
+    try {
+      await reportDiagnostic(-1, "boot", "Background renderer is loaded and ready.", 0);
+    } catch {}
     await sync(await OBR.scene.getMetadata());
   }
 
