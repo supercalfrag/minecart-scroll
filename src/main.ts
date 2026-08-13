@@ -21,7 +21,7 @@ const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v3";
 const LOCAL_CLONE_KEY = "com.supercalfrag.minecart-scroll/local-source-v3";
 const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v3";
 const BACKGROUND_HEALTH_KEY = "com.supercalfrag.minecart-scroll/background-health-v3";
-const LOCAL_TICK_MS = 33; // ~30fps. Serialized local updates favor stability over raw frame rate.
+const LOCAL_TICK_MS = 33; // ~30fps. One local interaction keeps all scenery layers phase-locked.
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 
@@ -72,9 +72,9 @@ type BackgroundHealth = {
 type LocalRenderLayer = {
   spec: RuntimeLayerSpec;
   clones: Image[];
-  lastOrderSignature: string;
-  zQueue: Promise<void>;
 };
+
+type SceneryInteraction = Awaited<ReturnType<typeof OBR.interaction.startItemInteraction>>;
 
 function motionAt(segment: MotionSegment, nowMs = Date.now()): { distance: number; speed: number } {
   const elapsed = Math.max(0, (nowMs - segment.segmentStartMs) / 1000);
@@ -269,18 +269,16 @@ async function makeLocalRenderLayer(spec: RuntimeLayerSpec): Promise<LocalRender
   return {
     spec,
     clones: localClones,
-    lastOrderSignature: "",
-    zQueue: Promise.resolve(),
   };
 }
 
 async function runLocalSceneryRenderer(): Promise<void> {
   let runtime: RuntimeState | null = null;
   let layers: LocalRenderLayer[] = [];
+  let sceneryInteraction: SceneryInteraction | null = null;
   let timer = 0;
   let generation = 0;
   let syncing = false;
-  let rendering = false;
   let reportedMovingRevision = -1;
   let reportedErrorRevision = -1;
   let runtimePollTimer = 0;
@@ -301,9 +299,6 @@ async function runLocalSceneryRenderer(): Promise<void> {
       atMs: Date.now(),
       message,
     };
-    // Diagnostics are client-specific, so keep them on the current player rather
-    // than global scene metadata. This lets the GM popover hear its own background
-    // renderer without cast/player clients racing the diagnostic value.
     await OBR.player.setMetadata({ [RENDERER_DIAG_KEY]: diagnostic });
   }
 
@@ -313,7 +308,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
         version: 1,
         atMs: Date.now(),
         sceneReady: await OBR.scene.isReady(),
-        message: "Background renderer iframe is alive.",
+        message: "Background interaction renderer is alive.",
       };
       await OBR.player.setMetadata({ [BACKGROUND_HEALTH_KEY]: health });
     } catch (error) {
@@ -323,10 +318,22 @@ async function runLocalSceneryRenderer(): Promise<void> {
     }
   }
 
+  function stopSceneryInteraction(): void {
+    if (!sceneryInteraction) return;
+    try {
+      const [, stop] = sceneryInteraction;
+      stop();
+    } catch (error) {
+      console.error("Minecart Scroll could not stop local scenery interaction:", error);
+    }
+    sceneryInteraction = null;
+  }
+
   async function clearRenderer(): Promise<void> {
     generation += 1;
     if (timer) window.clearTimeout(timer);
     timer = 0;
+    stopSceneryInteraction();
     await cleanupLocalScenery();
     layers = [];
   }
@@ -335,10 +342,9 @@ async function runLocalSceneryRenderer(): Promise<void> {
     syncing = true;
     const myGeneration = ++generation;
     try {
-      await reportDiagnostic(next.revision, "runtime", "Background renderer received the chase state.", 0);
+      await reportDiagnostic(next.revision, "runtime", "Background interaction renderer received the chase state.", 0);
 
-      // Keep the render heartbeat alive while scenery is rebuilt. The tick loop
-      // already checks `syncing`, so it will resume on the next heartbeat.
+      stopSceneryInteraction();
       await cleanupLocalScenery();
       if (myGeneration !== generation) return;
 
@@ -349,18 +355,33 @@ async function runLocalSceneryRenderer(): Promise<void> {
         nextLayers.push(layer);
       }
       if (myGeneration !== generation) return;
+
       layers = nextLayers;
+      const allClones = layers.flatMap((layer) => layer.clones);
+      if (allClones.length === 0) throw new Error("No local scenery clones were created.");
+
+      // One interaction owns every scenery clone. This keeps Floor / Background /
+      // Track / Foreground on the same local renderer clock instead of creating
+      // independent interaction streams for each layer.
+      sceneryInteraction = await OBR.interaction.startItemInteraction(allClones);
+      if (myGeneration !== generation) {
+        stopSceneryInteraction();
+        return;
+      }
+
       reportedMovingRevision = -1;
       reportedErrorRevision = -1;
       await reportDiagnostic(
         next.revision,
         "clones",
-        `Created ${layers.reduce((sum, layer) => sum + layer.clones.length, 0)} local scenery clones.`,
+        `Created ${allClones.length} local scenery clones and opened one interaction renderer.`,
+        allClones.length,
       );
     } catch (error) {
-      console.error("Minecart Scroll local renderer rebuild failed:", error);
+      console.error("Minecart Scroll local interaction renderer rebuild failed:", error);
+      stopSceneryInteraction();
       layers = [];
-      const message = error instanceof Error ? error.message : "Local renderer rebuild failed.";
+      const message = error instanceof Error ? error.message : "Local interaction renderer rebuild failed.";
       try {
         await reportDiagnostic(next.revision, "error", message, 0);
       } catch {}
@@ -369,68 +390,68 @@ async function runLocalSceneryRenderer(): Promise<void> {
     }
   }
 
-  async function renderTick(): Promise<void> {
-    if (rendering) return;
-    rendering = true;
+  function renderTick(): void {
     try {
-      if (!runtime || syncing || runtime.runState === "stopped" || layers.length === 0) return;
+      if (!runtime || syncing || runtime.runState === "stopped" || layers.length === 0 || !sceneryInteraction) {
+        return;
+      }
 
       const snapshot =
         runtime.runState === "running"
           ? motionAt(runtime.motion)
           : { distance: runtime.motion.distanceAtSegmentStart, speed: 0 };
 
-      // Serialize every local update. v0.3.2 fired overlapping fast updates plus
-      // independent z-order updates, which could race and leave the renderer static.
-      // Local items never cross the room network, so the conservative normal update
-      // path is preferable here while we validate the client-local architecture.
+      const positionById = new Map<string, { x: number; y: number }>();
       for (const layer of layers) {
         const distance = snapshot.distance * layer.spec.multiplier;
-        const xById = new Map<string, number>();
         for (let index = 0; index < layer.clones.length; index += 1) {
           const clone = layer.clones[index];
-          xById.set(
-            clone.id,
-            positionForDistance(
+          positionById.set(clone.id, {
+            x: positionForDistance(
               layer.spec.startX,
               layer.spec.spacing,
               layer.clones.length,
               index,
               distance,
             ),
-          );
+            y: layer.spec.y,
+          });
         }
-
-        const cloneIds = layer.clones.map((clone) => clone.id);
-        await OBR.scene.local.updateItems(cloneIds, (items) => {
-          for (const item of items) {
-            const x = xById.get(item.id);
-            if (x !== undefined) item.position.x = x;
-            item.position.y = layer.spec.y;
-          }
-        });
       }
+
+      const [update] = sceneryInteraction;
+      update((draft) => {
+        const applyPosition = (item: any): void => {
+          const position = positionById.get(item.id);
+          if (!position) return;
+          item.position.x = position.x;
+          item.position.y = position.y;
+        };
+
+        if (Array.isArray(draft)) {
+          for (const item of draft) applyPosition(item);
+        } else {
+          applyPosition(draft);
+        }
+      });
 
       if (runtime.runState === "running" && reportedMovingRevision !== runtime.revision) {
         reportedMovingRevision = runtime.revision;
-        await reportDiagnostic(
+        void reportDiagnostic(
           runtime.revision,
           "moving",
-          "Background renderer completed its first moving scenery frame.",
+          "Background renderer dispatched its first local interaction frame.",
         );
       }
     } catch (error) {
-      console.error("Minecart Scroll local render tick failed:", error);
+      console.error("Minecart Scroll local interaction render tick failed:", error);
       if (runtime && reportedErrorRevision !== runtime.revision) {
         reportedErrorRevision = runtime.revision;
-        const message = error instanceof Error ? error.message : "Local render tick failed.";
-        try {
-          await reportDiagnostic(runtime.revision, "error", message);
-        } catch {}
+        const message = error instanceof Error ? error.message : "Local interaction render tick failed.";
+        void reportDiagnostic(runtime.revision, "error", message).catch(() => {});
       }
     } finally {
-      rendering = false;
-      timer = window.setTimeout(() => void renderTick(), LOCAL_TICK_MS);
+      timer = window.setTimeout(renderTick, LOCAL_TICK_MS);
     }
   }
 
@@ -452,7 +473,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
       .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}:${layer.baseZ}:${layer.multiplier}`)
       .join("|");
 
-    if (layers.length === 0 || previousLayerSignature !== nextLayerSignature) {
+    if (layers.length === 0 || !sceneryInteraction || previousLayerSignature !== nextLayerSignature) {
       await rebuild(next);
     }
   }
@@ -460,7 +481,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
   await cleanupLocalScenery();
   if (await OBR.scene.isReady()) {
     try {
-      await reportDiagnostic(-1, "boot", "Background renderer is loaded and ready.", 0);
+      await reportDiagnostic(-1, "boot", "Background interaction renderer is loaded and ready.", 0);
     } catch {}
     await sync(await OBR.scene.getMetadata());
   }
@@ -502,7 +523,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
   void runtimePollTimer;
   void writeBackgroundHeartbeat();
   void pollRuntimeState();
-  void renderTick();
+  renderTick();
 }
 
 const backgroundMode = new URLSearchParams(window.location.search).get("background") === "1";
@@ -1982,7 +2003,7 @@ OBR.onReady(async () => {
     }
 
     try {
-      status.textContent = "Preparing local-render chase...";
+      status.textContent = "Preparing local-interaction chase...";
       await prepareChase();
       await OBR.player.deselect();
       if (focusOnStartCheckbox.checked) await goToAnchor();
@@ -2016,7 +2037,7 @@ OBR.onReady(async () => {
             throw new Error(`Local renderer error: ${diagnostic.message}`);
           }
           if (diagnostic.stage === "moving") break;
-          status.textContent = `Starting renderer: ${diagnostic.stage} (${diagnostic.cloneCount} clones)...`;
+          status.textContent = `Starting interaction renderer: ${diagnostic.stage} (${diagnostic.cloneCount} clones)...`;
         }
         await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
       }
@@ -2024,7 +2045,7 @@ OBR.onReady(async () => {
       if (diagnostic?.revision !== expectedRevision || diagnostic.stage !== "moving") {
         const stage = diagnostic?.revision === expectedRevision ? diagnostic.stage : "no response";
         throw new Error(
-          `Background renderer did not reach moving state (last stage: ${stage}). Shared scenery was left visible.`,
+          `Background interaction renderer did not reach moving state (last stage: ${stage}). Shared scenery was left visible.`,
         );
       }
 
@@ -2046,8 +2067,8 @@ OBR.onReady(async () => {
       ].filter(Boolean);
       status.textContent =
         extras.length > 0
-          ? `Local-render chase running with ${extras.join(", ")}.`
-          : "Local-render parallax chase running!";
+          ? `Local-interaction chase running with ${extras.join(", ")}.`
+          : "Local-interaction parallax chase running!";
     } catch (error) {
       if (runtimeState) {
         try {
