@@ -237,8 +237,9 @@ async function runLocalSceneryRenderer(): Promise<void> {
     syncing = true;
     const myGeneration = ++generation;
     try {
-      if (timer) window.clearTimeout(timer);
-      timer = 0;
+      // Keep the render heartbeat alive while scenery is rebuilt.
+      // The tick loop already checks `syncing`, so cancelling its timer here
+      // would strand the renderer after START with static local clones.
       await cleanupLocalScenery();
       if (myGeneration !== generation) return;
 
@@ -1832,7 +1833,7 @@ OBR.onReady(async () => {
       );
       if (localScenery.length === 0) {
         throw new Error(
-          "Local renderer did not start. Remove and re-add Minecart Scroll using the v0.3.3 manifest URL.",
+          "Local renderer did not start. Remove and re-add Minecart Scroll using the v0.3.4 manifest URL.",
         );
       }
 
@@ -1847,7 +1848,7 @@ OBR.onReady(async () => {
         const afterX = afterProbe[0]?.position.x;
         if (typeof afterX !== "number" || Math.abs(afterX - beforeX) < 0.01) {
           throw new Error(
-            "Local scenery was created, but its renderer is not advancing. v0.3.3 stopped safely before starting the carts.",
+            "Local scenery was created, but its renderer is not advancing. v0.3.4 stopped safely before starting the carts.",
           );
         }
       }
@@ -1885,8 +1886,14 @@ OBR.onReady(async () => {
         } catch {}
       }
       try {
-        await setSourceVisibility(true);
-      } catch {}
+        // Restore every shared source from the runtime definition itself.
+        // This is more reliable than depending on the active-layer objects
+        // after a failed local-render startup.
+        if (runtimeState) await commitRuntimeSources(runtimeState, 0, true);
+        else await setSourceVisibility(true);
+      } catch (restoreError) {
+        console.error("Could not restore shared scenery after startup failure:", restoreError);
+      }
       status.textContent = error instanceof Error ? error.message : "Could not start the chase.";
       closeMinecartInteraction();
       clearMinecartDropTimer();
