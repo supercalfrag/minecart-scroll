@@ -5,10 +5,15 @@ const TRACK_OVERLAP = 2;
 const FLOOR_Z_GAP = 100000;
 const TRACK_Z_GAP = 100000;
 const FOREGROUND_Z_GAP = 200000;
-const SCROLL_RENEW_FIRST_MS = 17000;
-const SCROLL_RENEW_LAST_MS = 25000;
-const SCROLL_RENEW_REPEAT_MS = 24000;
-const MINECART_RENEW_MS = 24000;
+const LAYER_RENEW_REPEAT_MS = 24000;
+const MINECART_RENEW_FIRST_MS = 28000;
+const MINECART_RENEW_REPEAT_MS = 24000;
+const LAYER_RENEW_FIRST_DELAY_MS: Record<string, number> = {
+  Floor: 16000,
+  Background: 19000,
+  Track: 22000,
+  Foreground: 25000,
+};
 const MINECART_DROP_SETTLE_MS = 250;
 
 type RunState = "stopped" | "running" | "paused";
@@ -319,8 +324,8 @@ OBR.onReady(async () => {
   let activeMinecarts: MinecartRattleGroup | null = null;
 
   type InteractionManager = Awaited<ReturnType<typeof OBR.interaction.startItemInteraction>>;
-  const scrollInteractions = new Map<string, InteractionManager>();
-  const scrollRenewTimers = new Map<string, number>();
+  const layerInteractions = new Map<string, InteractionManager>();
+  const layerRenewTimers = new Map<string, number>();
   let minecartInteractionUpdate: InteractionManager[0] | null = null;
   let minecartInteractionStop: InteractionManager[1] | null = null;
   let minecartRenewTimer = 0;
@@ -967,8 +972,6 @@ OBR.onReady(async () => {
   async function createMinecartInteraction(): Promise<InteractionManager | null> {
     if (!activeMinecarts || runState !== "running") return null;
 
-    // Keep every unselected cart rattling. The cart currently being moved is
-    // deliberately excluded so Owlbear's normal drag/keyboard controls own it.
     const ids = activeMinecarts.images
       .map((image) => image.id)
       .filter((id) => id !== draggedMinecartId);
@@ -978,9 +981,6 @@ OBR.onReady(async () => {
     const refreshedImages = refreshed.filter(isImage);
     if (refreshedImages.length !== ids.length) throw new Error("One or more minecart images disappeared from the scene.");
 
-    // Start replacement interactions from the exact current visual position,
-    // not the older committed scene position. This keeps cast-device handoffs
-    // from jumping backwards when an interaction is renewed.
     for (const image of refreshedImages) {
       const cart = activeMinecarts.states.get(image.id);
       if (!cart) continue;
@@ -991,15 +991,14 @@ OBR.onReady(async () => {
     return OBR.interaction.startItemInteraction(refreshedImages);
   }
 
-  function scheduleMinecartRenewal(): void {
+  function scheduleMinecartRenewal(delayMs: number): void {
     clearMinecartRenewTimer();
     if (runState !== "running" || !minecartInteractionUpdate) return;
-    minecartRenewTimer = window.setTimeout(() => void renewMinecartInteraction(), MINECART_RENEW_MS);
+    minecartRenewTimer = window.setTimeout(() => void renewMinecartInteraction(), delayMs);
   }
 
   async function renewMinecartInteraction(): Promise<void> {
     if (runState !== "running" || !minecartInteractionStop) return;
-
     const oldStop = minecartInteractionStop;
     let next: InteractionManager | null = null;
     try {
@@ -1008,26 +1007,16 @@ OBR.onReady(async () => {
         next?.[1]();
         return;
       }
-
       minecartInteractionUpdate = next[0];
       minecartInteractionStop = next[1];
-
-      try {
-        oldStop();
-      } catch (error) {
+      try { oldStop(); } catch (error) {
         console.error("Could not retire previous minecart rattle interaction:", error);
       }
-
-      scheduleMinecartRenewal();
+      scheduleMinecartRenewal(MINECART_RENEW_REPEAT_MS);
     } catch (error) {
       console.error("Minecart rattle renewal failed:", error);
-      try {
-        next?.[1]();
-      } catch {}
-      if (runState === "running") {
-        clearMinecartRenewTimer();
-        minecartRenewTimer = window.setTimeout(() => void renewMinecartInteraction(), 3000);
-      }
+      try { next?.[1](); } catch {}
+      if (runState === "running") scheduleMinecartRenewal(3000);
     }
   }
 
@@ -1037,7 +1026,7 @@ OBR.onReady(async () => {
     if (!interaction) return;
     minecartInteractionUpdate = interaction[0];
     minecartInteractionStop = interaction[1];
-    scheduleMinecartRenewal();
+    scheduleMinecartRenewal(MINECART_RENEW_FIRST_MS);
   }
 
   async function captureDroppedMinecart(id: string): Promise<void> {
@@ -1127,130 +1116,95 @@ OBR.onReady(async () => {
     scheduleMinecartDropCapture(draggedMinecartId);
   });
 
-  function clearScrollRenewTimers(): void {
-    for (const timer of scrollRenewTimers.values()) window.clearTimeout(timer);
-    scrollRenewTimers.clear();
+  function clearLayerRenewTimers(): void {
+    for (const timer of layerRenewTimers.values()) window.clearTimeout(timer);
+    layerRenewTimers.clear();
   }
 
-  function closeScrollInteractions(): void {
-    clearScrollRenewTimers();
-    for (const interaction of scrollInteractions.values()) {
+  function closeLayerInteractions(): void {
+    clearLayerRenewTimers();
+    for (const interaction of layerInteractions.values()) {
       try {
         interaction[1]();
       } catch (error) {
-        console.error("Could not stop a Minecart Scroll item interaction:", error);
+        console.error("Could not stop a Minecart Scroll layer interaction:", error);
       }
     }
-    scrollInteractions.clear();
+    layerInteractions.clear();
   }
 
-  async function createScrollItemInteraction(id: string): Promise<InteractionManager> {
-    const refreshed = await OBR.scene.items.getItems([id]);
-    const image = refreshed.find((item) => item.id === id);
-    if (!image || !isImage(image)) throw new Error("A scrolling image disappeared from the scene.");
+  async function createLayerInteraction(layer: LoopLayer): Promise<InteractionManager> {
+    const ids = layer.images.map((image) => image.id);
+    const refreshed = await OBR.scene.items.getItems(ids);
+    const refreshedImages = refreshed.filter(isImage);
+    if (refreshedImages.length !== ids.length) throw new Error(`${layer.name} images disappeared from the scene.`);
 
-    const layer = layerForItem(id);
-    if (!layer) throw new Error("A scrolling image is no longer assigned to an active layer.");
+    for (const image of refreshedImages) {
+      const x = layer.positions.get(image.id);
+      if (x !== undefined) image.position.x = x;
+      image.position.y = layer.y;
+    }
 
-    const x = layer.positions.get(id);
-    if (x !== undefined) image.position.x = x;
-    image.position.y = layer.y;
-
-    return OBR.interaction.startItemInteraction(image);
+    return OBR.interaction.startItemInteraction(refreshedImages);
   }
 
-  function scheduleScrollItemRenewal(id: string, delayMs: number): void {
-    const existing = scrollRenewTimers.get(id);
+  function scheduleLayerRenewal(layerName: string, delayMs: number): void {
+    const existing = layerRenewTimers.get(layerName);
     if (existing !== undefined) window.clearTimeout(existing);
+    if (runState !== "running") return;
 
     const timer = window.setTimeout(() => {
-      scrollRenewTimers.delete(id);
-      void renewScrollItemInteraction(id);
+      layerRenewTimers.delete(layerName);
+      void renewLayerInteraction(layerName);
     }, delayMs);
-    scrollRenewTimers.set(id, timer);
+    layerRenewTimers.set(layerName, timer);
   }
 
-  async function renewScrollItemInteraction(id: string): Promise<void> {
+  async function renewLayerInteraction(layerName: string): Promise<void> {
     if (runState !== "running") return;
-    const old = scrollInteractions.get(id);
-    if (!old) return;
+    const layer = getActiveLayers().find((candidate) => candidate.name === layerName);
+    const old = layerInteractions.get(layerName);
+    if (!layer || !old) return;
 
     let next: InteractionManager | null = null;
     try {
-      // Renew only one image at a time. Owlbear resets interpolation when a new
-      // interaction starts, so staggering individual images prevents the whole
-      // scrolling scene from freezing on cast/remote clients at once.
-      next = await createScrollItemInteraction(id);
+      // Renew the whole layer as one synchronized unit. Tiles within a layer
+      // always share the same interpolation clock, so recycling cannot create
+      // gaps or overlaps during the network handoff.
+      next = await createLayerInteraction(layer);
       if (runState !== "running") {
         next[1]();
         return;
       }
 
-      scrollInteractions.set(id, next);
-      try {
-        old[1]();
-      } catch (error) {
-        console.error("Could not retire previous scrolling item interaction:", error);
+      layerInteractions.set(layerName, next);
+      try { old[1](); } catch (error) {
+        console.error(`Could not retire previous ${layerName} interaction:`, error);
       }
-
-      scheduleScrollItemRenewal(id, SCROLL_RENEW_REPEAT_MS);
+      scheduleLayerRenewal(layerName, LAYER_RENEW_REPEAT_MS);
     } catch (error) {
-      console.error("Scrolling item renewal failed:", error);
-      try {
-        next?.[1]();
-      } catch {}
-      if (runState === "running") scheduleScrollItemRenewal(id, 3000);
+      console.error(`${layerName} interaction renewal failed:`, error);
+      try { next?.[1](); } catch {}
+      if (runState === "running") scheduleLayerRenewal(layerName, 3000);
     }
   }
 
-  function getStaggeredScrollIds(): string[] {
-    const queues = getActiveLayers().map((layer) => layer.images.map((image) => image.id));
-    const ids: string[] = [];
-    let index = 0;
-
-    while (queues.some((queue) => index < queue.length)) {
-      for (const queue of queues) {
-        if (index < queue.length) ids.push(queue[index]);
-      }
-      index += 1;
+  async function openLayerInteractions(): Promise<void> {
+    closeLayerInteractions();
+    for (const layer of getActiveLayers()) {
+      const interaction = await createLayerInteraction(layer);
+      layerInteractions.set(layer.name, interaction);
     }
 
-    return ids;
-  }
-
-  function scheduleInitialScrollRenewals(): void {
-    clearScrollRenewTimers();
-    const ids = getStaggeredScrollIds();
-    if (ids.length === 0) return;
-
-    const span = SCROLL_RENEW_LAST_MS - SCROLL_RENEW_FIRST_MS;
-    ids.forEach((id, index) => {
-      const fraction = ids.length <= 1 ? 0.5 : index / (ids.length - 1);
-      scheduleScrollItemRenewal(id, Math.round(SCROLL_RENEW_FIRST_MS + span * fraction));
-    });
-  }
-
-  async function openScrollInteractions(): Promise<void> {
-    closeScrollInteractions();
-    const ids = getActiveImages().map((image) => image.id);
-
-    try {
-      for (const id of ids) {
-        const interaction = await createScrollItemInteraction(id);
-        scrollInteractions.set(id, interaction);
-      }
-    } catch (error) {
-      closeScrollInteractions();
-      throw error;
+    for (const layer of getActiveLayers()) {
+      scheduleLayerRenewal(layer.name, LAYER_RENEW_FIRST_DELAY_MS[layer.name] ?? 22000);
     }
-
-    scheduleInitialScrollRenewals();
   }
 
   function cleanupInteractionForPageExit(): void {
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
-    closeScrollInteractions();
+    closeLayerInteractions();
     closeMinecartInteraction();
     clearMinecartDropTimer();
   }
@@ -1266,7 +1220,7 @@ OBR.onReady(async () => {
     } catch (error) {
       console.error("Could not commit positions while panel was hidden:", error);
     } finally {
-      closeScrollInteractions();
+      closeLayerInteractions();
       closeMinecartInteraction();
       await resetMinecarts();
       currentSpeed = 0;
@@ -1321,16 +1275,16 @@ OBR.onReady(async () => {
     if (activeForeground) moveLayer(activeForeground, deltaTime, foregroundMultiplier);
     updateMinecartRattle(time / 1000);
 
-    for (const [id, interaction] of scrollInteractions) {
-      const layer = layerForItem(id);
-      if (!layer) continue;
-      const x = layer.positions.get(id);
-
+    for (const layer of getActiveLayers()) {
+      const interaction = layerInteractions.get(layer.name);
+      if (!interaction) continue;
       interaction[0]((draft) => {
-        const item = Array.isArray(draft) ? draft.find((candidate) => candidate.id === id) : draft;
-        if (!item) return;
-        if (x !== undefined) item.position.x = x;
-        item.position.y = layer.y;
+        const items = Array.isArray(draft) ? draft : [draft];
+        for (const item of items) {
+          const x = layer.positions.get(item.id);
+          if (x !== undefined) item.position.x = x;
+          item.position.y = layer.y;
+        }
       });
     }
 
@@ -1431,16 +1385,14 @@ OBR.onReady(async () => {
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
       runState = "running";
-      await openScrollInteractions();
+      await openLayerInteractions();
       await openMinecartInteraction();
       lastTime = performance.now();
       animationFrame = requestAnimationFrame(animate);
-      updateRunButtons();
+            updateRunButtons();
       const extras = [activeFloor ? "floor" : "", activeForeground ? "foreground" : "", activeMinecarts ? "minecart rattle" : ""].filter(Boolean);
       status.textContent = extras.length > 0 ? `Chase running with ${extras.join(", ")}.` : "Parallax chase running!";
     } catch (error) {
-      closeScrollInteractions();
-      closeMinecartInteraction();
       status.textContent = error instanceof Error ? error.message : "Could not start the chase.";
       activeFloor = null;
       activeTrack = null;
@@ -1458,9 +1410,9 @@ OBR.onReady(async () => {
 
   pauseButton.addEventListener("click", async () => {
     if (runState !== "running" || renewing) return;
-    cancelAnimationFrame(animationFrame);
+        cancelAnimationFrame(animationFrame);
     await commitPositions();
-    closeScrollInteractions();
+    closeLayerInteractions();
     closeMinecartInteraction();
     await resetMinecarts();
     currentSpeed = 0;
@@ -1476,11 +1428,11 @@ OBR.onReady(async () => {
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
       runState = "running";
-      await openScrollInteractions();
+      await openLayerInteractions();
       await openMinecartInteraction();
       lastTime = performance.now();
       animationFrame = requestAnimationFrame(animate);
-      updateRunButtons();
+            updateRunButtons();
       status.textContent = "Resumed — accelerating back to target speed.";
     } catch (error) {
       status.textContent = error instanceof Error ? error.message : "Could not resume the chase.";
@@ -1489,11 +1441,11 @@ OBR.onReady(async () => {
 
   stopButton.addEventListener("click", async () => {
     if (runState === "stopped" || renewing) return;
-    cancelAnimationFrame(animationFrame);
+        cancelAnimationFrame(animationFrame);
     animationFrame = 0;
 
     if (runState === "running") await commitPositions();
-    closeScrollInteractions();
+    closeLayerInteractions();
     closeMinecartInteraction();
     clearMinecartDropTimer();
     draggedMinecartId = null;
@@ -1513,9 +1465,9 @@ OBR.onReady(async () => {
   });
 
   emergencyResetButton.addEventListener("click", async () => {
-    if (animationFrame) cancelAnimationFrame(animationFrame);
+        if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
-    closeScrollInteractions();
+    closeLayerInteractions();
     closeMinecartInteraction();
     clearMinecartDropTimer();
     draggedMinecartId = null;
