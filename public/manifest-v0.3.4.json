@@ -1,0 +1,14 @@
+{
+  "name": "Minecart Scroll",
+  "version": "0.3.4",
+  "manifest_version": 1,
+  "icon": "/minecart-scroll/minecart-icon.svg",
+  "background_url": "/minecart-scroll/?background=1&v=0.3.4",
+  "action": {
+    "title": "Minecart Scroll",
+    "icon": "/minecart-scroll/minecart-icon.svg",
+    "popover": "/minecart-scroll/?v=0.3.4",
+    "height": 600,
+    "width": 350
+  }
+}
