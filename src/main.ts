@@ -20,6 +20,7 @@ const MINECART_DROP_SETTLE_MS = 250;
 const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v3";
 const LOCAL_CLONE_KEY = "com.supercalfrag.minecart-scroll/local-source-v3";
 const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v3";
+const BACKGROUND_HEALTH_KEY = "com.supercalfrag.minecart-scroll/background-health-v3";
 const LOCAL_TICK_MS = 33; // ~30fps. Serialized local updates favor stability over raw frame rate.
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
@@ -58,6 +59,13 @@ type RendererDiagnostic = {
   stage: RendererDiagnosticStage;
   cloneCount: number;
   atMs: number;
+  message: string;
+};
+
+type BackgroundHealth = {
+  version: 1;
+  atMs: number;
+  sceneReady: boolean;
   message: string;
 };
 
@@ -194,6 +202,23 @@ async function readRendererDiagnostic(): Promise<RendererDiagnostic | null> {
   return parseRendererDiagnostic(metadata[RENDERER_DIAG_KEY]);
 }
 
+function parseBackgroundHealth(raw: unknown): BackgroundHealth | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Partial<BackgroundHealth>;
+  if (value.version !== 1 || typeof value.atMs !== "number") return null;
+  return {
+    version: 1,
+    atMs: value.atMs,
+    sceneReady: value.sceneReady === true,
+    message: typeof value.message === "string" ? value.message : "",
+  };
+}
+
+async function readBackgroundHealth(): Promise<BackgroundHealth | null> {
+  const metadata = await OBR.player.getMetadata();
+  return parseBackgroundHealth(metadata[BACKGROUND_HEALTH_KEY]);
+}
+
 function localCloneMetadata(sourceId: string): Metadata {
   return { [LOCAL_CLONE_KEY]: sourceId };
 }
@@ -258,6 +283,9 @@ async function runLocalSceneryRenderer(): Promise<void> {
   let rendering = false;
   let reportedMovingRevision = -1;
   let reportedErrorRevision = -1;
+  let runtimePollTimer = 0;
+  let healthTimer = 0;
+  let lastRuntimePollSignature = "";
 
   async function reportDiagnostic(
     revision: number,
@@ -277,6 +305,22 @@ async function runLocalSceneryRenderer(): Promise<void> {
     // than global scene metadata. This lets the GM popover hear its own background
     // renderer without cast/player clients racing the diagnostic value.
     await OBR.player.setMetadata({ [RENDERER_DIAG_KEY]: diagnostic });
+  }
+
+  async function writeBackgroundHeartbeat(): Promise<void> {
+    try {
+      const health: BackgroundHealth = {
+        version: 1,
+        atMs: Date.now(),
+        sceneReady: await OBR.scene.isReady(),
+        message: "Background renderer iframe is alive.",
+      };
+      await OBR.player.setMetadata({ [BACKGROUND_HEALTH_KEY]: health });
+    } catch (error) {
+      console.error("Minecart Scroll background heartbeat failed:", error);
+    } finally {
+      healthTimer = window.setTimeout(() => void writeBackgroundHeartbeat(), 1000);
+    }
   }
 
   async function clearRenderer(): Promise<void> {
@@ -421,21 +465,43 @@ async function runLocalSceneryRenderer(): Promise<void> {
     await sync(await OBR.scene.getMetadata());
   }
 
-  OBR.scene.onMetadataChange((metadata) => {
-    void sync(metadata);
-  });
+  async function pollRuntimeState(): Promise<void> {
+    try {
+      if (await OBR.scene.isReady()) {
+        const metadata = await OBR.scene.getMetadata();
+        const next = parseRuntime(metadata[RUNTIME_KEY]);
+        const signature = next ? `${next.revision}:${next.runState}` : "none";
+        if (signature !== lastRuntimePollSignature) {
+          lastRuntimePollSignature = signature;
+          await sync(metadata);
+        }
+      }
+    } catch (error) {
+      console.error("Minecart Scroll runtime poll failed:", error);
+    } finally {
+      runtimePollTimer = window.setTimeout(() => void pollRuntimeState(), 250);
+    }
+  }
 
   OBR.scene.onReadyChange((ready) => {
     void (async () => {
       if (!ready) {
         runtime = null;
+        lastRuntimePollSignature = "";
         await clearRenderer();
         return;
       }
-      await sync(await OBR.scene.getMetadata());
+      const metadata = await OBR.scene.getMetadata();
+      const next = parseRuntime(metadata[RUNTIME_KEY]);
+      lastRuntimePollSignature = next ? `${next.revision}:${next.runState}` : "none";
+      await sync(metadata);
     })();
   });
 
+  void healthTimer;
+  void runtimePollTimer;
+  void writeBackgroundHeartbeat();
+  void pollRuntimeState();
   void renderTick();
 }
 
@@ -502,7 +568,8 @@ if (backgroundMode) {
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div style="font-family: Arial, sans-serif; padding: 14px;">
     <h2 style="margin: 0 0 8px; text-align: center;">Minecart Scroll</h2>
-    <p id="status" style="text-align:center; margin: 6px 0 12px;">Waiting for Owlbear...</p>
+    <p id="status" style="text-align:center; margin: 6px 0 6px;">Waiting for Owlbear...</p>
+    <p id="rendererHealth" style="text-align:center; margin:0 0 12px; font-size:12px; font-weight:bold;">Background renderer: checking...</p>
 
     <div id="playerPanel" hidden style="text-align:center; padding: 18px 8px;">
       <h3>Chase View</h3>
@@ -651,6 +718,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 
 OBR.onReady(async () => {
   const status = document.querySelector<HTMLParagraphElement>("#status")!;
+  const rendererHealth = document.querySelector<HTMLParagraphElement>("#rendererHealth")!;
   const gmPanel = document.querySelector<HTMLDivElement>("#gmPanel")!;
   const playerPanel = document.querySelector<HTMLDivElement>("#playerPanel")!;
 
@@ -708,6 +776,27 @@ OBR.onReady(async () => {
   const rattleStartSpeedInput = document.querySelector<HTMLInputElement>("#rattleStartSpeedInput")!;
 
   const startButton = document.querySelector<HTMLButtonElement>("#startButton")!;
+
+  async function refreshRendererHealth(): Promise<void> {
+    try {
+      const [health, diagnostic] = await Promise.all([readBackgroundHealth(), readRendererDiagnostic()]);
+      const age = health ? Date.now() - health.atMs : Number.POSITIVE_INFINITY;
+      const online = age < 2500;
+      const healthText = online
+        ? `ONLINE${health?.sceneReady ? " / scene ready" : " / waiting for scene"}`
+        : "OFFLINE";
+      const diagText = diagnostic
+        ? ` | stage: ${diagnostic.stage}${diagnostic.cloneCount ? ` (${diagnostic.cloneCount} clones)` : ""}`
+        : " | stage: none";
+      rendererHealth.textContent = `Background renderer: ${healthText}${diagText}`;
+    } catch (error) {
+      rendererHealth.textContent = "Background renderer: health check failed";
+      console.error("Could not read background renderer health:", error);
+    }
+  }
+
+  window.setInterval(() => void refreshRendererHealth(), 500);
+  void refreshRendererHealth();
   const pauseButton = document.querySelector<HTMLButtonElement>("#pauseButton")!;
   const resumeButton = document.querySelector<HTMLButtonElement>("#resumeButton")!;
   const stopButton = document.querySelector<HTMLButtonElement>("#stopButton")!;
@@ -1883,6 +1972,12 @@ OBR.onReady(async () => {
     if (runState !== "stopped" || renewing) return;
     if (!(await OBR.scene.isReady())) {
       status.textContent = "Open a scene first.";
+      return;
+    }
+
+    const rendererHealthState = await readBackgroundHealth();
+    if (!rendererHealthState || Date.now() - rendererHealthState.atMs >= 2500) {
+      status.textContent = "Background renderer is OFFLINE. The hidden background page is not running, so Start was cancelled safely.";
       return;
     }
 
