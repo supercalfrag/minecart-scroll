@@ -19,6 +19,7 @@ const MINECART_DROP_SETTLE_MS = 250;
 
 const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v3";
 const LOCAL_CLONE_KEY = "com.supercalfrag.minecart-scroll/local-source-v3";
+const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v3";
 const LOCAL_TICK_MS = 33; // ~30fps. Serialized local updates favor stability over raw frame rate.
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
@@ -47,6 +48,17 @@ type RuntimeState = {
   runState: RunState;
   layers: RuntimeLayerSpec[];
   motion: MotionSegment;
+};
+
+type RendererDiagnosticStage = "boot" | "runtime" | "clones" | "moving" | "error";
+
+type RendererDiagnostic = {
+  version: 1;
+  revision: number;
+  stage: RendererDiagnosticStage;
+  cloneCount: number;
+  atMs: number;
+  message: string;
 };
 
 type LocalRenderLayer = {
@@ -162,6 +174,27 @@ async function writeRuntimeState(runtime: RuntimeState): Promise<void> {
   await OBR.scene.setMetadata({ [RUNTIME_KEY]: runtime });
 }
 
+function parseRendererDiagnostic(raw: unknown): RendererDiagnostic | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Partial<RendererDiagnostic>;
+  if (value.version !== 1 || typeof value.revision !== "number" || typeof value.stage !== "string") return null;
+  if (value.stage !== "boot" && value.stage !== "runtime" && value.stage !== "clones" && value.stage !== "moving" && value.stage !== "error") return null;
+  return {
+    version: 1,
+    revision: value.revision,
+    stage: value.stage,
+    cloneCount: Math.max(0, Number(value.cloneCount) || 0),
+    atMs: Number(value.atMs) || 0,
+    message: typeof value.message === "string" ? value.message : "",
+  };
+}
+
+async function readRendererDiagnostic(): Promise<RendererDiagnostic | null> {
+  if (!(await OBR.scene.isReady())) return null;
+  const metadata = await OBR.scene.getMetadata();
+  return parseRendererDiagnostic(metadata[RENDERER_DIAG_KEY]);
+}
+
 function localCloneMetadata(sourceId: string): Metadata {
   return { [LOCAL_CLONE_KEY]: sourceId };
 }
@@ -224,6 +257,27 @@ async function runLocalSceneryRenderer(): Promise<void> {
   let generation = 0;
   let syncing = false;
   let rendering = false;
+  let reportedMovingRevision = -1;
+  let reportedErrorRevision = -1;
+  const canReportDiagnostics = (await OBR.player.getRole()) === "GM";
+
+  async function reportDiagnostic(
+    revision: number,
+    stage: RendererDiagnosticStage,
+    message: string,
+    cloneCount = layers.reduce((sum, layer) => sum + layer.clones.length, 0),
+  ): Promise<void> {
+    if (!canReportDiagnostics || !(await OBR.scene.isReady())) return;
+    const diagnostic: RendererDiagnostic = {
+      version: 1,
+      revision,
+      stage,
+      cloneCount,
+      atMs: Date.now(),
+      message,
+    };
+    await OBR.scene.setMetadata({ [RENDERER_DIAG_KEY]: diagnostic });
+  }
 
   async function clearRenderer(): Promise<void> {
     generation += 1;
@@ -237,22 +291,35 @@ async function runLocalSceneryRenderer(): Promise<void> {
     syncing = true;
     const myGeneration = ++generation;
     try {
-      // Keep the render heartbeat alive while scenery is rebuilt.
-      // The tick loop already checks `syncing`, so cancelling its timer here
-      // would strand the renderer after START with static local clones.
+      await reportDiagnostic(next.revision, "runtime", "Background renderer received the chase state.", 0);
+
+      // Keep the render heartbeat alive while scenery is rebuilt. The tick loop
+      // already checks `syncing`, so it will resume on the next heartbeat.
       await cleanupLocalScenery();
       if (myGeneration !== generation) return;
 
       const nextLayers: LocalRenderLayer[] = [];
       for (const spec of next.layers) {
         const layer = await makeLocalRenderLayer(spec);
-        if (layer) nextLayers.push(layer);
+        if (!layer) throw new Error(`Could not create local ${spec.name} scenery.`);
+        nextLayers.push(layer);
       }
       if (myGeneration !== generation) return;
       layers = nextLayers;
+      reportedMovingRevision = -1;
+      reportedErrorRevision = -1;
+      await reportDiagnostic(
+        next.revision,
+        "clones",
+        `Created ${layers.reduce((sum, layer) => sum + layer.clones.length, 0)} local scenery clones.`,
+      );
     } catch (error) {
       console.error("Minecart Scroll local renderer rebuild failed:", error);
       layers = [];
+      const message = error instanceof Error ? error.message : "Local renderer rebuild failed.";
+      try {
+        await reportDiagnostic(next.revision, "error", message, 0);
+      } catch {}
     } finally {
       syncing = false;
     }
@@ -298,8 +365,24 @@ async function runLocalSceneryRenderer(): Promise<void> {
           }
         });
       }
+
+      if (runtime.runState === "running" && reportedMovingRevision !== runtime.revision) {
+        reportedMovingRevision = runtime.revision;
+        await reportDiagnostic(
+          runtime.revision,
+          "moving",
+          "Background renderer completed its first moving scenery frame.",
+        );
+      }
     } catch (error) {
       console.error("Minecart Scroll local render tick failed:", error);
+      if (runtime && reportedErrorRevision !== runtime.revision) {
+        reportedErrorRevision = runtime.revision;
+        const message = error instanceof Error ? error.message : "Local render tick failed.";
+        try {
+          await reportDiagnostic(runtime.revision, "error", message);
+        } catch {}
+      }
     } finally {
       rendering = false;
       timer = window.setTimeout(() => void renderTick(), LOCAL_TICK_MS);
@@ -331,6 +414,11 @@ async function runLocalSceneryRenderer(): Promise<void> {
 
   await cleanupLocalScenery();
   if (await OBR.scene.isReady()) {
+    if (canReportDiagnostics) {
+      try {
+        await reportDiagnostic(-1, "boot", "Background renderer is loaded and ready.", 0);
+      } catch {}
+    }
     await sync(await OBR.scene.getMetadata());
   }
 
@@ -1819,39 +1907,36 @@ OBR.onReady(async () => {
         "running",
       );
 
-      // The shared items become source assets only. Every client renders local
-      // copies from the runtime metadata, so scenery movement never crosses the network.
-      await setSourceVisibility(false);
+      // Publish the chase clock first while the shared scenery remains visible.
+      // The background renderer must explicitly report a successful moving frame
+      // before we hide the originals. This makes startup failure non-destructive.
       await writeRuntimeState(runtimeState);
 
-      // Confirm that this player's hidden background page actually created the
-      // local scenery. If the extension was only refreshed instead of reinstalled
-      // after adding background_url, fail visibly instead of leaving Start as a no-op.
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 350));
-      const localScenery = await OBR.scene.local.getItems(
-        (item) => typeof item.metadata?.[LOCAL_CLONE_KEY] === "string",
-      );
-      if (localScenery.length === 0) {
+      const expectedRevision = runtimeState.revision;
+      const deadline = Date.now() + 3500;
+      let diagnostic: RendererDiagnostic | null = null;
+      while (Date.now() < deadline) {
+        diagnostic = await readRendererDiagnostic();
+        if (diagnostic?.revision === expectedRevision) {
+          if (diagnostic.stage === "error") {
+            throw new Error(`Local renderer error: ${diagnostic.message}`);
+          }
+          if (diagnostic.stage === "moving") break;
+          status.textContent = `Starting renderer: ${diagnostic.stage} (${diagnostic.cloneCount} clones)...`;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+      }
+
+      if (diagnostic?.revision !== expectedRevision || diagnostic.stage !== "moving") {
+        const stage = diagnostic?.revision === expectedRevision ? diagnostic.stage : "no response";
         throw new Error(
-          "Local renderer did not start. Remove and re-add Minecart Scroll using the v0.3.4 manifest URL.",
+          `Background renderer did not reach moving state (last stage: ${stage}). Shared scenery was left visible.`,
         );
       }
 
-      // Do not report a successful Start until the local renderer proves that it
-      // can advance scenery. This catches a live background page whose update loop
-      // is stalled or rejected by the client.
-      if (targetSpeed > 0) {
-        const probeId = localScenery[0].id;
-        const beforeX = localScenery[0].position.x;
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 1200));
-        const afterProbe = await OBR.scene.local.getItems([probeId]);
-        const afterX = afterProbe[0]?.position.x;
-        if (typeof afterX !== "number" || Math.abs(afterX - beforeX) < 0.01) {
-          throw new Error(
-            "Local scenery was created, but its renderer is not advancing. v0.3.4 stopped safely before starting the carts.",
-          );
-        }
-      }
+      // Now that the client-local renderer has proven it can advance scenery,
+      // hide the shared source images and reveal the moving local copies beneath.
+      await setSourceVisibility(false);
 
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
@@ -1886,11 +1971,9 @@ OBR.onReady(async () => {
         } catch {}
       }
       try {
-        // Restore every shared source from the runtime definition itself.
-        // This is more reliable than depending on the active-layer objects
-        // after a failed local-render startup.
-        if (runtimeState) await commitRuntimeSources(runtimeState, 0, true);
-        else await setSourceVisibility(true);
+        // Shared scenery is intentionally not hidden until the renderer proves
+        // it is moving, but force visibility here as a final safety net.
+        await setSourceVisibility(true);
       } catch (restoreError) {
         console.error("Could not restore shared scenery after startup failure:", restoreError);
       }
