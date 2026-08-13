@@ -1852,7 +1852,7 @@ OBR.onReady(async () => {
       );
       if (localScenery.length === 0) {
         throw new Error(
-          "Local renderer did not start. Remove and re-add Minecart Scroll using the v0.3.1 manifest URL.",
+          "Local renderer did not start. Remove and re-add Minecart Scroll using the v0.3.2 manifest URL.",
         );
       }
 
@@ -2085,6 +2085,15 @@ OBR.onReady(async () => {
     runState = next.runState;
     updateRunButtons();
   });
+
+  // These legacy helpers are intentionally retained for the frozen 0.2.x rollback
+  // path, but v0.3.x scenery rendering no longer calls them directly. Keep an
+  // explicit reference so projects with TypeScript noUnusedLocals enabled compile.
+  void lastTime;
+  void moveLayer;
+  void commitPositions;
+  void openLayerInteractions;
+  void approach;
 
   updateRunButtons();
 });
