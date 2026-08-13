@@ -19,7 +19,7 @@ const MINECART_DROP_SETTLE_MS = 250;
 
 const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v3";
 const LOCAL_CLONE_KEY = "com.supercalfrag.minecart-scroll/local-source-v3";
-const LOCAL_TICK_MS = 20;
+const LOCAL_TICK_MS = 33; // ~30fps. Serialized local updates favor stability over raw frame rate.
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 
@@ -223,6 +223,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
   let timer = 0;
   let generation = 0;
   let syncing = false;
+  let rendering = false;
 
   async function clearRenderer(): Promise<void> {
     generation += 1;
@@ -256,73 +257,52 @@ async function runLocalSceneryRenderer(): Promise<void> {
     }
   }
 
-  function updateLocalZOrder(layer: LocalRenderLayer, xById: Map<string, number>): void {
-    const ordered = [...layer.clones]
-      .sort((a, b) => (xById.get(a.id) ?? 0) - (xById.get(b.id) ?? 0))
-      .map((item) => item.id);
-    const signature = ordered.join("|");
-    if (signature === layer.lastOrderSignature) return;
-    layer.lastOrderSignature = signature;
-    const zById = new Map(ordered.map((id, index) => [id, layer.spec.baseZ + index]));
+  async function renderTick(): Promise<void> {
+    if (rendering) return;
+    rendering = true;
+    try {
+      if (!runtime || syncing || runtime.runState === "stopped" || layers.length === 0) return;
 
-    layer.zQueue = layer.zQueue
-      .then(async () => {
+      const snapshot =
+        runtime.runState === "running"
+          ? motionAt(runtime.motion)
+          : { distance: runtime.motion.distanceAtSegmentStart, speed: 0 };
+
+      // Serialize every local update. v0.3.2 fired overlapping fast updates plus
+      // independent z-order updates, which could race and leave the renderer static.
+      // Local items never cross the room network, so the conservative normal update
+      // path is preferable here while we validate the client-local architecture.
+      for (const layer of layers) {
+        const distance = snapshot.distance * layer.spec.multiplier;
+        const xById = new Map<string, number>();
+        for (let index = 0; index < layer.clones.length; index += 1) {
+          const clone = layer.clones[index];
+          xById.set(
+            clone.id,
+            positionForDistance(
+              layer.spec.startX,
+              layer.spec.spacing,
+              layer.clones.length,
+              index,
+              distance,
+            ),
+          );
+        }
+
         await OBR.scene.local.updateItems(layer.clones, (items) => {
-          for (const item of items) {
-            const z = zById.get(item.id);
-            if (z !== undefined) {
-              item.zIndex = z;
-              item.disableAutoZIndex = true;
-            }
-          }
-        });
-      })
-      .catch((error) => console.error("Minecart Scroll local z-order update failed:", error));
-  }
-
-  function renderTick(): void {
-    if (!runtime || syncing || runtime.runState === "stopped" || layers.length === 0) {
-      timer = window.setTimeout(renderTick, LOCAL_TICK_MS);
-      return;
-    }
-
-    const snapshot =
-      runtime.runState === "running"
-        ? motionAt(runtime.motion)
-        : { distance: runtime.motion.distanceAtSegmentStart, speed: 0 };
-
-    for (const layer of layers) {
-      const distance = snapshot.distance * layer.spec.multiplier;
-      const xById = new Map<string, number>();
-      for (let index = 0; index < layer.clones.length; index += 1) {
-        const clone = layer.clones[index];
-        xById.set(
-          clone.id,
-          positionForDistance(
-            layer.spec.startX,
-            layer.spec.spacing,
-            layer.clones.length,
-            index,
-            distance,
-          ),
-        );
-      }
-
-      void OBR.scene.local.updateItems(
-        layer.clones,
-        (items) => {
           for (const item of items) {
             const x = xById.get(item.id);
             if (x !== undefined) item.position.x = x;
             item.position.y = layer.spec.y;
           }
-        },
-        true,
-      );
-      updateLocalZOrder(layer, xById);
+        });
+      }
+    } catch (error) {
+      console.error("Minecart Scroll local render tick failed:", error);
+    } finally {
+      rendering = false;
+      timer = window.setTimeout(() => void renderTick(), LOCAL_TICK_MS);
     }
-
-    timer = window.setTimeout(renderTick, LOCAL_TICK_MS);
   }
 
   async function sync(metadata: Metadata): Promise<void> {
@@ -368,7 +348,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
     })();
   });
 
-  renderTick();
+  void renderTick();
 }
 
 const backgroundMode = new URLSearchParams(window.location.search).get("background") === "1";
@@ -1852,8 +1832,24 @@ OBR.onReady(async () => {
       );
       if (localScenery.length === 0) {
         throw new Error(
-          "Local renderer did not start. Remove and re-add Minecart Scroll using the v0.3.2 manifest URL.",
+          "Local renderer did not start. Remove and re-add Minecart Scroll using the v0.3.3 manifest URL.",
         );
+      }
+
+      // Do not report a successful Start until the local renderer proves that it
+      // can advance scenery. This catches a live background page whose update loop
+      // is stalled or rejected by the client.
+      if (targetSpeed > 0) {
+        const probeId = localScenery[0].id;
+        const beforeX = localScenery[0].position.x;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1200));
+        const afterProbe = await OBR.scene.local.getItems([probeId]);
+        const afterX = afterProbe[0]?.position.x;
+        if (typeof afterX !== "number" || Math.abs(afterX - beforeX) < 0.01) {
+          throw new Error(
+            "Local scenery was created, but its renderer is not advancing. v0.3.3 stopped safely before starting the carts.",
+          );
+        }
       }
 
       currentSpeed = 0;
