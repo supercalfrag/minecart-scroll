@@ -367,8 +367,14 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
   if (!broken) throw new Error("The designated Broken Cart could not be found.");
   if (allCarts.length === 0) throw new Error("No player minecarts are available for the crash.");
 
-  const targetTrack = crashTrackForY(state.brokenHome.y, state.track1Y, state.track2Y);
+  // Choose the hazard lane from the Broken Cart's CURRENT scene position.
+  // This mirrors player-cart lane classification and prevents a stale armed/home
+  // position from forcing every crash onto the same track.
+  const targetTrack = crashTrackForY(broken.position.y, state.track1Y, state.track2Y);
   const targetY = targetTrack === 1 ? state.track1Y : state.track2Y;
+  console.info(
+    `Minecart Scroll crash: Broken Cart current Y ${Math.round(broken.position.y)} -> Track ${targetTrack} (Track 1 Y ${Math.round(state.track1Y)}, Track 2 Y ${Math.round(state.track2Y)}).`,
+  );
   // Classify carts from their CURRENT scene position when the warning is clicked.
   // This lets carts switch rails during play without needing to be reassigned.
   const carts = allCarts.filter(
@@ -1769,7 +1775,7 @@ OBR.onReady(async () => {
     await closeCrashWarningPopover();
     await OBR.popover.open({
       id: CRASH_POPOVER_ID,
-      url: `${window.location.pathname}?crashWarning=1&v=0.5.5`,
+      url: `${window.location.pathname}?crashWarning=1&v=0.5.6`,
       width: 64,
       height: 64,
       anchorReference: "POSITION",
