@@ -19,6 +19,8 @@ const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v41";
 const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v41";
 const BACKGROUND_HEALTH_KEY = "com.supercalfrag.minecart-scroll/background-health-v41";
 const LOCAL_TICK_MS = 20; // 50fps target for the background shared-item interaction renderer.
+const MAX_INTERNAL_SPEED = 1500; // 50 ft/s on a 5 ft / 150 DPI scene.
+const MAX_INTERNAL_ACCELERATION = 1000;
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 type RuntimeLayerSpec = {
@@ -785,7 +787,8 @@ OBR.onReady(async () => {
   function configureSpeedControlRanges(): void {
     if (!speedScaleReady) return;
 
-    const maxFeetPerSecond = internalSpeedToFeetPerSecond(1000);
+    const maxFeetPerSecond = internalSpeedToFeetPerSecond(MAX_INTERNAL_SPEED);
+    const maxAccelerationFeetPerSecondSquared = internalSpeedToFeetPerSecond(MAX_INTERNAL_ACCELERATION);
     const minAccelerationFeetPerSecondSquared = internalSpeedToFeetPerSecond(25);
     const step = speedUiStep(maxFeetPerSecond);
     targetSpeedSlider.min = "0";
@@ -793,7 +796,7 @@ OBR.onReady(async () => {
     targetSpeedSlider.step = String(step);
 
     accelerationSlider.min = String(minAccelerationFeetPerSecondSquared);
-    accelerationSlider.max = String(maxFeetPerSecond);
+    accelerationSlider.max = String(maxAccelerationFeetPerSecondSquared);
     accelerationSlider.step = String(step);
 
     rattleStartSpeedInput.min = "0";
@@ -841,7 +844,7 @@ OBR.onReady(async () => {
     foregroundOverlap = clampNumber(Number(foregroundOverlapInput.value), 0, 50, 0);
     rattleEnabled = rattleEnabledCheckbox.checked;
     rattleStrength = clampNumber(Number(rattleStrengthSlider.value), 0, 200, 100) / 100;
-    rattleStartSpeed = clampNumber(feetPerSecondToInternalSpeed(Number(rattleStartSpeedInput.value)), 0, 1000, 100);
+    rattleStartSpeed = clampNumber(feetPerSecondToInternalSpeed(Number(rattleStartSpeedInput.value)), 0, MAX_INTERNAL_SPEED, 100);
   }
   function updateLayerLabels(): void {
     floorStatus.textContent = floorIds.length >= 2 ? `${floorIds.length} images` : "Not set (optional)";
@@ -863,7 +866,7 @@ OBR.onReady(async () => {
     loadButton.disabled = runState !== "stopped";
   }
   function applyTargetSpeed(value: number): void {
-    targetSpeed = clampNumber(value, 0, 1000, 150);
+    targetSpeed = clampNumber(value, 0, MAX_INTERNAL_SPEED, 150);
     if (speedScaleReady) {
       targetSpeedSlider.value = String(internalSpeedToFeetPerSecond(targetSpeed));
       targetSpeedValue.textContent = formatFeetPerSecondFromInternal(targetSpeed);
@@ -874,7 +877,7 @@ OBR.onReady(async () => {
     applyTargetSpeed(feetPerSecondToInternalSpeed(value));
   }
   function applyAcceleration(value: number): void {
-    acceleration = clampNumber(value, 25, 1000, 200);
+    acceleration = clampNumber(value, 25, MAX_INTERNAL_ACCELERATION, 200);
     if (speedScaleReady) {
       accelerationSlider.value = String(internalSpeedToFeetPerSecond(acceleration));
       accelerationValue.textContent = formatFeetPerSecondFromInternal(acceleration);
@@ -1051,14 +1054,14 @@ OBR.onReady(async () => {
       floorOverlap: clampNumber(Number(value.floorOverlap), 0, 50, 0),
       backgroundOverlap: clampNumber(Number(value.backgroundOverlap), 0, 50, 0),
       foregroundOverlap: clampNumber(Number(value.foregroundOverlap), 0, 50, 0),
-      targetSpeed: clampNumber(Number(value.targetSpeed), 0, 1000, 150),
-      acceleration: clampNumber(Number(value.acceleration), 25, 1000, 200),
+      targetSpeed: clampNumber(Number(value.targetSpeed), 0, MAX_INTERNAL_SPEED, 150),
+      acceleration: clampNumber(Number(value.acceleration), 25, MAX_INTERNAL_ACCELERATION, 200),
       floorMultiplier: clampNumber(Number(value.floorMultiplier), 0, 1, 0.45),
       backgroundMultiplier: clampNumber(Number(value.backgroundMultiplier), 0, 1, 0.4),
       foregroundMultiplier: clampNumber(Number(value.foregroundMultiplier), 1, 2.5, 1.4),
       rattleEnabled: typeof value.rattleEnabled === "boolean" ? value.rattleEnabled : true,
       rattleStrength: clampNumber(Number(value.rattleStrength), 0, 2, 1),
-      rattleStartSpeed: clampNumber(Number(value.rattleStartSpeed), 0, 1000, 100),
+      rattleStartSpeed: clampNumber(Number(value.rattleStartSpeed), 0, MAX_INTERNAL_SPEED, 100),
       focusOnStart: typeof value.focusOnStart === "boolean" ? value.focusOnStart : true,
     };
   }
@@ -1726,7 +1729,7 @@ OBR.onReady(async () => {
       for (const cart of activeMinecarts.states.values()) cart.offsetY = 0;
       return;
     }
-    const range = Math.max(1, 1000 - rattleStartSpeed);
+    const range = Math.max(1, MAX_INTERNAL_SPEED - rattleStartSpeed);
     const raw = clampNumber((currentSpeed - rattleStartSpeed) / range, 0, 1, 0);
     const intensity = raw * raw * (3 - 2 * raw);
     const amplitude = 8 * intensity * rattleStrength;
