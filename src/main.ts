@@ -24,7 +24,7 @@ const MAX_INTERNAL_SPEED = 1500; // 50 ft/s on a 5 ft / 150 DPI scene.
 const MAX_INTERNAL_ACCELERATION = 1000;
 const SUBTLE_GM_INTERACTION_COLOR = "#64748B"; // muted slate
 const SUBTLE_CAST_INTERACTION_COLOR = "#6B7280"; // muted charcoal
-const CRASH_STATE_KEY = "com.supercalfrag.minecart-scroll/crash-state-v1";
+const CRASH_STATE_KEY = "com.supercalfrag.minecart-scroll/crash-state-v2";
 const CRASH_CHANNEL = "com.supercalfrag.minecart-scroll/crash-control-v1";
 const CRASH_POPOVER_ID = "com.supercalfrag.minecart-scroll/crash-warning";
 const CRASH_APPROACH_MS = 1800;
@@ -218,10 +218,12 @@ type CrashHome = {
 };
 
 type CrashRuntimeState = {
-  version: 1;
+  version: 2;
   chaseRevision: number;
   brokenCartId: string;
   minecartIds: string[];
+  track1Y: number;
+  track2Y: number;
   status: "armed" | "running" | "complete";
   brokenHome: CrashHome;
   cartHomes: CrashHome[];
@@ -231,10 +233,12 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Partial<CrashRuntimeState>;
   if (
-    value.version !== 1 ||
+    value.version !== 2 ||
     typeof value.chaseRevision !== "number" ||
     typeof value.brokenCartId !== "string" ||
     !Array.isArray(value.minecartIds) ||
+    !Number.isFinite(value.track1Y) ||
+    !Number.isFinite(value.track2Y) ||
     (value.status !== "armed" && value.status !== "running" && value.status !== "complete") ||
     !value.brokenHome ||
     typeof value.brokenHome !== "object" ||
@@ -277,10 +281,12 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
   }
 
   return {
-    version: 1,
+    version: 2,
     chaseRevision: value.chaseRevision,
     brokenCartId: value.brokenCartId,
     minecartIds: value.minecartIds.filter((id): id is string => typeof id === "string"),
+    track1Y: Number(value.track1Y),
+    track2Y: Number(value.track2Y),
     status: value.status,
     brokenHome: {
       id: broken.id,
@@ -326,30 +332,44 @@ async function waitMs(ms: number): Promise<void> {
   await new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
+function crashTrackForY(y: number, track1Y: number, track2Y: number): 1 | 2 {
+  return Math.abs(y - track1Y) <= Math.abs(y - track2Y) ? 1 : 2;
+}
+
 async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<void> {
   const shared = await OBR.scene.items.getItems([state.brokenCartId, ...state.minecartIds]);
   const byId = new Map(shared.filter(isImage).map((image) => [image.id, image] as const));
   const broken = byId.get(state.brokenCartId);
-  const carts = state.minecartIds.map((id) => byId.get(id)).filter((image): image is Image => Boolean(image));
+  const allCarts = state.minecartIds.map((id) => byId.get(id)).filter((image): image is Image => Boolean(image));
   if (!broken) throw new Error("The designated Broken Cart could not be found.");
-  if (carts.length === 0) throw new Error("No player minecarts are available for the crash.");
+  if (allCarts.length === 0) throw new Error("No player minecarts are available for the crash.");
+
+  const targetTrack = crashTrackForY(state.brokenHome.y, state.track1Y, state.track2Y);
+  const targetY = targetTrack === 1 ? state.track1Y : state.track2Y;
+  // Classify carts from their CURRENT scene position when the warning is clicked.
+  // This lets carts switch rails during play without needing to be reassigned.
+  const carts = allCarts.filter(
+    (cart) => crashTrackForY(cart.position.y, state.track1Y, state.track2Y) === targetTrack,
+  );
+  if (carts.length === 0) {
+    throw new Error(`No player minecarts are currently on Track ${targetTrack}.`);
+  }
 
   const sortedCarts = [...carts].sort((a, b) => b.position.x - a.position.x);
   const frontCart = sortedCarts[0];
-  const averageY = carts.reduce((sum, cart) => sum + cart.position.y, 0) / carts.length;
   const [frontBounds, brokenBounds, viewportWidth] = await Promise.all([
     OBR.scene.items.getItemBounds([frontCart.id]),
     OBR.scene.items.getItemBounds([broken.id]),
     OBR.viewport.getWidth(),
   ]);
-  const frontScreen = await OBR.viewport.transformPoint({ x: frontCart.position.x, y: averageY });
+  const frontScreen = await OBR.viewport.transformPoint({ x: frontCart.position.x, y: targetY });
   const spawnPoint = await OBR.viewport.inverseTransformPoint({
     x: viewportWidth + Math.max(100, brokenBounds.width * 0.75),
     y: frontScreen.y,
   });
 
   const impactX = frontCart.position.x + Math.max(24, (frontBounds.width + brokenBounds.width) * 0.38);
-  const impactY = averageY;
+  const impactY = targetY;
   const baseBrokenRotation = broken.rotation;
 
   await OBR.scene.items.updateItems([broken.id], (items) => {
@@ -840,13 +860,15 @@ type MinecartRattleGroup = {
   states: Map<string, MinecartRattleState>;
 };
 type SavedSettings = {
-  version: 4;
+  version: 5;
   floorIds: string[];
   trackIds: string[];
   backgroundIds: string[];
   foregroundIds: string[];
   minecartIds: string[];
   brokenCartId: string | null;
+  crashTrack1Y: number | null;
+  crashTrack2Y: number | null;
   anchorX: number;
   anchorY: number;
   floorYOffset: number;
@@ -899,8 +921,19 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 
         <button id="setBrokenCartButton">Set Broken Cart</button>
         <span id="brokenCartStatus">Not set (optional)</span>
-        <p style="font-size:12px; margin-bottom:0;">
+        <p style="font-size:12px; margin:6px 0 10px;">
           Select one separate broken/wrecked cart. During a chase a GM-only ⚠ trigger hovers on the right side.
+        </p>
+
+        <hr style="border:0; border-top:1px solid #7775; margin:10px 0;">
+        <strong>Crash Tracks</strong><br><br>
+        <button id="setCrashTrack1Button">Set Track 1 Position</button>
+        <span id="crashTrack1Status">Not set</span><br><br>
+        <button id="setCrashTrack2Button">Set Track 2 Position</button>
+        <span id="crashTrack2Status">Not set</span>
+        <p style="font-size:12px; margin-bottom:0;">
+          Select one cart or image centered on each rail, then set its track position.
+          When ⚠ is clicked, only minecarts currently closest to the broken cart's rail will crash.
         </p>
       </fieldset>
 
@@ -1032,12 +1065,16 @@ OBR.onReady(async () => {
   const foregroundStatus = document.querySelector<HTMLSpanElement>("#foregroundStatus")!;
   const minecartsStatus = document.querySelector<HTMLSpanElement>("#minecartsStatus")!;
   const brokenCartStatus = document.querySelector<HTMLSpanElement>("#brokenCartStatus")!;
+  const crashTrack1Status = document.querySelector<HTMLSpanElement>("#crashTrack1Status")!;
+  const crashTrack2Status = document.querySelector<HTMLSpanElement>("#crashTrack2Status")!;
   const setFloorButton = document.querySelector<HTMLButtonElement>("#setFloorButton")!;
   const setTrackButton = document.querySelector<HTMLButtonElement>("#setTrackButton")!;
   const setBackgroundButton = document.querySelector<HTMLButtonElement>("#setBackgroundButton")!;
   const setForegroundButton = document.querySelector<HTMLButtonElement>("#setForegroundButton")!;
   const setMinecartsButton = document.querySelector<HTMLButtonElement>("#setMinecartsButton")!;
   const setBrokenCartButton = document.querySelector<HTMLButtonElement>("#setBrokenCartButton")!;
+  const setCrashTrack1Button = document.querySelector<HTMLButtonElement>("#setCrashTrack1Button")!;
+  const setCrashTrack2Button = document.querySelector<HTMLButtonElement>("#setCrashTrack2Button")!;
   const saveButton = document.querySelector<HTMLButtonElement>("#saveButton")!;
   const loadButton = document.querySelector<HTMLButtonElement>("#loadButton")!;
   const anchorXInput = document.querySelector<HTMLInputElement>("#anchorXInput")!;
@@ -1096,6 +1133,8 @@ OBR.onReady(async () => {
   let foregroundIds: string[] = [];
   let minecartIds: string[] = [];
   let brokenCartId: string | null = null;
+  let crashTrack1Y: number | null = null;
+  let crashTrack2Y: number | null = null;
 
   let anchorX = 0;
   let anchorY = 0;
@@ -1249,6 +1288,8 @@ OBR.onReady(async () => {
     foregroundStatus.textContent = foregroundIds.length >= 2 ? `${foregroundIds.length} images` : "Not set (optional)";
     minecartsStatus.textContent = minecartIds.length >= 1 ? `${minecartIds.length} images` : "Not set (optional)";
     brokenCartStatus.textContent = brokenCartId ? "1 image" : "Not set (optional)";
+    crashTrack1Status.textContent = crashTrack1Y === null ? "Not set" : `Y ${Math.round(crashTrack1Y)}`;
+    crashTrack2Status.textContent = crashTrack2Y === null ? "Not set" : `Y ${Math.round(crashTrack2Y)}`;
   }
   function updateRunButtons(): void {
     startButton.disabled = runState !== "stopped" || renewing;
@@ -1261,6 +1302,8 @@ OBR.onReady(async () => {
     setForegroundButton.disabled = runState !== "stopped";
     setMinecartsButton.disabled = runState !== "stopped";
     setBrokenCartButton.disabled = runState !== "stopped";
+    setCrashTrack1Button.disabled = runState !== "stopped";
+    setCrashTrack2Button.disabled = runState !== "stopped";
     loadButton.disabled = runState !== "stopped";
   }
   function applyTargetSpeed(value: number): void {
@@ -1432,6 +1475,34 @@ OBR.onReady(async () => {
   setMinecartsButton.addEventListener("click", () => void setLayer("minecarts"));
   setBrokenCartButton.addEventListener("click", () => void setLayer("brokenCart"));
 
+  async function setCrashTrackPosition(trackNumber: 1 | 2): Promise<void> {
+    if (runState !== "stopped") {
+      status.textContent = "Stop the chase before changing crash track positions.";
+      return;
+    }
+    const images = await getSelectedImages(1);
+    if (!images) return;
+    if (images.length !== 1) {
+      status.textContent = "Select exactly ONE cart or image centered on the track.";
+      return;
+    }
+
+    const y = images[0].position.y;
+    const otherY = trackNumber === 1 ? crashTrack2Y : crashTrack1Y;
+    if (otherY !== null && Math.abs(y - otherY) < 1) {
+      status.textContent = "Track 1 and Track 2 must use different vertical positions.";
+      return;
+    }
+
+    if (trackNumber === 1) crashTrack1Y = y;
+    else crashTrack2Y = y;
+    updateLayerLabels();
+    await OBR.player.deselect();
+    status.textContent = `Crash Track ${trackNumber} position set at Y ${Math.round(y)}.`;
+  }
+  setCrashTrack1Button.addEventListener("click", () => void setCrashTrackPosition(1));
+  setCrashTrack2Button.addEventListener("click", () => void setCrashTrackPosition(2));
+
   async function closeCrashWarningPopover(): Promise<void> {
     try {
       await OBR.popover.close(CRASH_POPOVER_ID);
@@ -1444,7 +1515,7 @@ OBR.onReady(async () => {
     await closeCrashWarningPopover();
     await OBR.popover.open({
       id: CRASH_POPOVER_ID,
-      url: `${window.location.pathname}?crashWarning=1&v=0.5.0`,
+      url: `${window.location.pathname}?crashWarning=1&v=0.5.1`,
       width: 64,
       height: 64,
       anchorReference: "POSITION",
@@ -1457,7 +1528,14 @@ OBR.onReady(async () => {
   }
 
   async function armCrashHazard(): Promise<boolean> {
-    if (!brokenCartId || minecartIds.length === 0 || !runtimeState) {
+    if (
+      !brokenCartId ||
+      minecartIds.length === 0 ||
+      !runtimeState ||
+      crashTrack1Y === null ||
+      crashTrack2Y === null ||
+      Math.abs(crashTrack1Y - crashTrack2Y) < 1
+    ) {
       await closeCrashWarningPopover();
       return false;
     }
@@ -1468,10 +1546,12 @@ OBR.onReady(async () => {
     if (!broken || carts.length === 0) return false;
 
     const state: CrashRuntimeState = {
-      version: 1,
+      version: 2,
       chaseRevision: runtimeState.revision,
       brokenCartId,
       minecartIds: carts.map((cart) => cart.id),
+      track1Y: crashTrack1Y,
+      track2Y: crashTrack2Y,
       status: "armed",
       brokenHome: {
         id: broken.id,
@@ -1518,13 +1598,15 @@ OBR.onReady(async () => {
   function makeSavedSettings(): SavedSettings {
     readControls();
     return {
-      version: 4,
+      version: 5,
       floorIds: [...floorIds],
       trackIds: [...trackIds],
       backgroundIds: [...backgroundIds],
       foregroundIds: [...foregroundIds],
       minecartIds: [...minecartIds],
       brokenCartId,
+      crashTrack1Y,
+      crashTrack2Y,
       anchorX,
       anchorY,
       floorYOffset,
@@ -1548,13 +1630,15 @@ OBR.onReady(async () => {
     if (!raw || typeof raw !== "object") return null;
     const value = raw as Partial<SavedSettings>;
     return {
-      version: 4,
+      version: 5,
       floorIds: Array.isArray(value.floorIds) ? value.floorIds.filter((id): id is string => typeof id === "string") : [],
       trackIds: Array.isArray(value.trackIds) ? value.trackIds.filter((id): id is string => typeof id === "string") : [],
       backgroundIds: Array.isArray(value.backgroundIds) ? value.backgroundIds.filter((id): id is string => typeof id === "string") : [],
       foregroundIds: Array.isArray(value.foregroundIds) ? value.foregroundIds.filter((id): id is string => typeof id === "string") : [],
       minecartIds: Array.isArray(value.minecartIds) ? value.minecartIds.filter((id): id is string => typeof id === "string") : [],
       brokenCartId: typeof value.brokenCartId === "string" ? value.brokenCartId : null,
+      crashTrack1Y: Number.isFinite(value.crashTrack1Y) ? Number(value.crashTrack1Y) : null,
+      crashTrack2Y: Number.isFinite(value.crashTrack2Y) ? Number(value.crashTrack2Y) : null,
       anchorX: Number.isFinite(value.anchorX) ? Number(value.anchorX) : 0,
       anchorY: Number.isFinite(value.anchorY) ? Number(value.anchorY) : 0,
       floorYOffset: clampNumber(Number(value.floorYOffset), -10000, 10000, 0),
@@ -1581,6 +1665,8 @@ OBR.onReady(async () => {
     foregroundIds = [...saved.foregroundIds];
     minecartIds = [...saved.minecartIds];
     brokenCartId = saved.brokenCartId;
+    crashTrack1Y = saved.crashTrack1Y;
+    crashTrack2Y = saved.crashTrack2Y;
     anchorXInput.value = String(saved.anchorX);
     anchorYInput.value = String(saved.anchorY);
     floorYOffsetInput.value = String(saved.floorYOffset);
@@ -2473,6 +2559,9 @@ OBR.onReady(async () => {
         extras.length > 0
           ? `Background interaction chase running with ${extras.join(", ")}.`
           : "Background interaction parallax chase running!";
+      if (brokenCartId && (!crashArmed) && (crashTrack1Y === null || crashTrack2Y === null)) {
+        status.textContent += " Broken-cart hazard needs Track 1 and Track 2 positions before it can arm.";
+      }
     } catch (error) {
       if (runtimeState) {
         try {
