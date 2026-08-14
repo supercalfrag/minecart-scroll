@@ -1,4 +1,4 @@
-import OBR, { buildImage, isImage, type Image, type Metadata } from "@owlbear-rodeo/sdk";
+import OBR, { isImage, type Image, type Metadata } from "@owlbear-rodeo/sdk";
 
 const SETTINGS_KEY = "com.supercalfrag.minecart-scroll/settings";
 const TRACK_OVERLAP = 2;
@@ -17,11 +17,10 @@ const LAYER_RENEW_FIRST_DELAY_MS: Record<string, number> = {
 const MINECART_DROP_SETTLE_MS = 250;
 
 
-const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v3";
-const LOCAL_CLONE_KEY = "com.supercalfrag.minecart-scroll/local-source-v3";
-const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v3";
-const BACKGROUND_HEALTH_KEY = "com.supercalfrag.minecart-scroll/background-health-v3";
-const LOCAL_TICK_MS = 33; // ~30fps. One local interaction keeps all scenery layers phase-locked.
+const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v41";
+const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v41";
+const BACKGROUND_HEALTH_KEY = "com.supercalfrag.minecart-scroll/background-health-v41";
+const LOCAL_TICK_MS = 20; // 50fps target for the background shared-item interaction renderer.
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 
@@ -51,13 +50,13 @@ type RuntimeState = {
   motion: MotionSegment;
 };
 
-type RendererDiagnosticStage = "boot" | "runtime" | "clones" | "moving" | "error";
+type RendererDiagnosticStage = "boot" | "runtime" | "items" | "moving" | "error";
 
 type RendererDiagnostic = {
   version: 1;
   revision: number;
   stage: RendererDiagnosticStage;
-  cloneCount: number;
+  itemCount: number;
   atMs: number;
   message: string;
 };
@@ -69,12 +68,6 @@ type BackgroundHealth = {
   message: string;
 };
 
-type LocalRenderLayer = {
-  spec: RuntimeLayerSpec;
-  clones: Image[];
-};
-
-type SceneryInteraction = Awaited<ReturnType<typeof OBR.interaction.startItemInteraction>>;
 
 function motionAt(segment: MotionSegment, nowMs = Date.now()): { distance: number; speed: number } {
   const elapsed = Math.max(0, (nowMs - segment.segmentStartMs) / 1000);
@@ -186,12 +179,12 @@ function parseRendererDiagnostic(raw: unknown): RendererDiagnostic | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Partial<RendererDiagnostic>;
   if (value.version !== 1 || typeof value.revision !== "number" || typeof value.stage !== "string") return null;
-  if (value.stage !== "boot" && value.stage !== "runtime" && value.stage !== "clones" && value.stage !== "moving" && value.stage !== "error") return null;
+  if (value.stage !== "boot" && value.stage !== "runtime" && value.stage !== "items" && value.stage !== "moving" && value.stage !== "error") return null;
   return {
     version: 1,
     revision: value.revision,
     stage: value.stage,
-    cloneCount: Math.max(0, Number(value.cloneCount) || 0),
+    itemCount: Math.max(0, Number(value.itemCount) || 0),
     atMs: Number(value.atMs) || 0,
     message: typeof value.message === "string" ? value.message : "",
   };
@@ -219,83 +212,39 @@ async function readBackgroundHealth(): Promise<BackgroundHealth | null> {
   return parseBackgroundHealth(metadata[BACKGROUND_HEALTH_KEY]);
 }
 
-function localCloneMetadata(sourceId: string): Metadata {
-  return { [LOCAL_CLONE_KEY]: sourceId };
-}
+type SharedRenderEntry = {
+  image: Image;
+  spec: RuntimeLayerSpec;
+  index: number;
+};
 
-function cloneImageForLocal(source: Image): Image {
-  return buildImage(source.image, source.grid)
-    .name(`Minecart Scroll: ${source.name || "scenery"}`)
-    .position({ ...source.position })
-    .rotation(source.rotation)
-    .scale({ ...source.scale })
-    .layer(source.layer)
-    .zIndex(source.zIndex)
-    .visible(true)
-    .locked(true)
-    .disableHit(true)
-    .disableAutoZIndex(true)
-    .metadata(localCloneMetadata(source.id))
-    .build();
-}
+type SharedInteractionManager = {
+  update: (recipe: (draft: Image | Image[]) => void) => void;
+  stop: () => void;
+};
 
-async function cleanupLocalScenery(): Promise<void> {
-  const existing = await OBR.scene.local.getItems(
-    (item) => typeof item.metadata?.[LOCAL_CLONE_KEY] === "string",
-  );
-  if (existing.length > 0) {
-    await OBR.scene.local.deleteItems(existing.map((item) => item.id));
-  }
-}
-
-async function makeLocalRenderLayer(spec: RuntimeLayerSpec): Promise<LocalRenderLayer | null> {
-  const shared = await OBR.scene.items.getItems(spec.ids);
-  const byId = new Map(shared.filter(isImage).map((image) => [image.id, image]));
-  const sources = spec.ids
-    .map((id) => byId.get(id))
-    .filter((image): image is Image => image !== undefined);
-  if (sources.length !== spec.ids.length) return null;
-
-  const clones = sources.map(cloneImageForLocal);
-  await OBR.scene.local.addItems(clones);
-
-  const added = await OBR.scene.local.getItems(clones.map((clone) => clone.id));
-  const addedById = new Map(added.filter(isImage).map((image) => [image.id, image]));
-  const localClones = clones
-    .map((clone) => addedById.get(clone.id))
-    .filter((image): image is Image => image !== undefined);
-
-  if (localClones.length !== clones.length) return null;
-  return {
-    spec,
-    clones: localClones,
-  };
-}
-
-async function runLocalSceneryRenderer(): Promise<void> {
+async function runSharedInteractionRenderer(): Promise<void> {
   let runtime: RuntimeState | null = null;
-  let layers: LocalRenderLayer[] = [];
-  let sceneryInteraction: SceneryInteraction | null = null;
+  let entries: SharedRenderEntry[] = [];
+  let manager: SharedInteractionManager | null = null;
   let timer = 0;
-  let generation = 0;
-  let syncing = false;
+  let healthTimer = 0;
+  let runtimePollTimer = 0;
+  let lastRuntimePollSignature = "";
   let reportedMovingRevision = -1;
   let reportedErrorRevision = -1;
-  let runtimePollTimer = 0;
-  let healthTimer = 0;
-  let lastRuntimePollSignature = "";
 
   async function reportDiagnostic(
     revision: number,
     stage: RendererDiagnosticStage,
     message: string,
-    cloneCount = layers.reduce((sum, layer) => sum + layer.clones.length, 0),
+    itemCount = entries.length,
   ): Promise<void> {
     const diagnostic: RendererDiagnostic = {
       version: 1,
       revision,
       stage,
-      cloneCount,
+      itemCount,
       atMs: Date.now(),
       message,
     };
@@ -308,7 +257,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
         version: 1,
         atMs: Date.now(),
         sceneReady: await OBR.scene.isReady(),
-        message: "Background interaction renderer is alive.",
+        message: "Background shared-item interaction renderer is alive.",
       };
       await OBR.player.setMetadata({ [BACKGROUND_HEALTH_KEY]: health });
     } catch (error) {
@@ -318,120 +267,94 @@ async function runLocalSceneryRenderer(): Promise<void> {
     }
   }
 
-  function stopSceneryInteraction(): void {
-    if (!sceneryInteraction) return;
-    try {
-      const [, stop] = sceneryInteraction;
-      stop();
-    } catch (error) {
-      console.error("Minecart Scroll could not stop local scenery interaction:", error);
+  function stopInteraction(): void {
+    if (manager) {
+      try {
+        manager.stop();
+      } catch (error) {
+        console.error("Minecart Scroll could not stop scenery interaction:", error);
+      }
+      manager = null;
     }
-    sceneryInteraction = null;
-  }
-
-  async function clearRenderer(): Promise<void> {
-    generation += 1;
-    if (timer) window.clearTimeout(timer);
-    timer = 0;
-    stopSceneryInteraction();
-    await cleanupLocalScenery();
-    layers = [];
+    entries = [];
   }
 
   async function rebuild(next: RuntimeState): Promise<void> {
-    syncing = true;
-    const myGeneration = ++generation;
+    stopInteraction();
     try {
-      await reportDiagnostic(next.revision, "runtime", "Background interaction renderer received the chase state.", 0);
+      await reportDiagnostic(next.revision, "runtime", "Background renderer received the chase state.", 0);
 
-      stopSceneryInteraction();
-      await cleanupLocalScenery();
-      if (myGeneration !== generation) return;
-
-      const nextLayers: LocalRenderLayer[] = [];
+      const nextEntries: SharedRenderEntry[] = [];
+      const interactionImages: Image[] = [];
       for (const spec of next.layers) {
-        const layer = await makeLocalRenderLayer(spec);
-        if (!layer) throw new Error(`Could not create local ${spec.name} scenery.`);
-        nextLayers.push(layer);
-      }
-      if (myGeneration !== generation) return;
-
-      layers = nextLayers;
-      const allClones = layers.flatMap((layer) => layer.clones);
-      if (allClones.length === 0) throw new Error("No local scenery clones were created.");
-
-      // One interaction owns every scenery clone. This keeps Floor / Background /
-      // Track / Foreground on the same local renderer clock instead of creating
-      // independent interaction streams for each layer.
-      sceneryInteraction = await OBR.interaction.startItemInteraction(allClones);
-      if (myGeneration !== generation) {
-        stopSceneryInteraction();
-        return;
+        const shared = await OBR.scene.items.getItems(spec.ids);
+        const byId = new Map(shared.filter(isImage).map((image) => [image.id, image] as const));
+        for (let index = 0; index < spec.ids.length; index += 1) {
+          const image = byId.get(spec.ids[index]);
+          if (!image) throw new Error(`Could not load shared ${spec.name} scenery item ${index + 1}.`);
+          interactionImages.push(image);
+          nextEntries.push({ image, spec, index });
+        }
       }
 
+      if (interactionImages.length === 0) throw new Error("No shared scenery items were available for the renderer.");
+
+      const [update, stop] = await OBR.interaction.startItemInteraction(interactionImages);
+      manager = {
+        update: update as SharedInteractionManager["update"],
+        stop,
+      };
+      entries = nextEntries;
       reportedMovingRevision = -1;
       reportedErrorRevision = -1;
       await reportDiagnostic(
         next.revision,
-        "clones",
-        `Created ${allClones.length} local scenery clones and opened one interaction renderer.`,
-        allClones.length,
+        "items",
+        `Opened one shared-item interaction for ${entries.length} scenery images.`,
+        entries.length,
       );
     } catch (error) {
-      console.error("Minecart Scroll local interaction renderer rebuild failed:", error);
-      stopSceneryInteraction();
-      layers = [];
-      const message = error instanceof Error ? error.message : "Local interaction renderer rebuild failed.";
+      stopInteraction();
+      const message = error instanceof Error ? error.message : "Could not open the shared scenery interaction.";
+      console.error("Minecart Scroll shared interaction renderer rebuild failed:", error);
       try {
         await reportDiagnostic(next.revision, "error", message, 0);
       } catch {}
-    } finally {
-      syncing = false;
     }
   }
 
   function renderTick(): void {
     try {
-      if (!runtime || syncing || runtime.runState === "stopped" || layers.length === 0 || !sceneryInteraction) {
-        return;
-      }
+      if (!runtime || runtime.runState === "stopped" || !manager || entries.length === 0) return;
 
       const snapshot =
         runtime.runState === "running"
           ? motionAt(runtime.motion)
           : { distance: runtime.motion.distanceAtSegmentStart, speed: 0 };
 
-      const positionById = new Map<string, { x: number; y: number }>();
-      for (const layer of layers) {
-        const distance = snapshot.distance * layer.spec.multiplier;
-        for (let index = 0; index < layer.clones.length; index += 1) {
-          const clone = layer.clones[index];
-          positionById.set(clone.id, {
-            x: positionForDistance(
-              layer.spec.startX,
-              layer.spec.spacing,
-              layer.clones.length,
-              index,
-              distance,
-            ),
-            y: layer.spec.y,
-          });
-        }
+      const xById = new Map<string, number>();
+      const yById = new Map<string, number>();
+      for (const entry of entries) {
+        xById.set(
+          entry.image.id,
+          positionForDistance(
+            entry.spec.startX,
+            entry.spec.spacing,
+            entry.spec.ids.length,
+            entry.index,
+            snapshot.distance * entry.spec.multiplier,
+          ),
+        );
+        yById.set(entry.image.id, entry.spec.y);
       }
 
-      const [update] = sceneryInteraction;
-      update((draft) => {
-        const applyPosition = (item: any): void => {
-          const position = positionById.get(item.id);
-          if (!position) return;
-          item.position.x = position.x;
-          item.position.y = position.y;
-        };
-
-        if (Array.isArray(draft)) {
-          for (const item of draft) applyPosition(item);
-        } else {
-          applyPosition(draft);
+      manager.update((draft) => {
+        const items = Array.isArray(draft) ? draft : [draft];
+        for (const item of items) {
+          const x = xById.get(item.id);
+          const y = yById.get(item.id);
+          if (x !== undefined) item.position.x = x;
+          if (y !== undefined) item.position.y = y;
         }
       });
 
@@ -440,15 +363,16 @@ async function runLocalSceneryRenderer(): Promise<void> {
         void reportDiagnostic(
           runtime.revision,
           "moving",
-          "Background renderer dispatched its first local interaction frame.",
+          "Background shared-item interaction completed its first moving frame.",
+          entries.length,
         );
       }
     } catch (error) {
-      console.error("Minecart Scroll local interaction render tick failed:", error);
+      console.error("Minecart Scroll shared interaction render tick failed:", error);
       if (runtime && reportedErrorRevision !== runtime.revision) {
         reportedErrorRevision = runtime.revision;
-        const message = error instanceof Error ? error.message : "Local interaction render tick failed.";
-        void reportDiagnostic(runtime.revision, "error", message).catch(() => {});
+        const message = error instanceof Error ? error.message : "Shared interaction render tick failed.";
+        void reportDiagnostic(runtime.revision, "error", message, entries.length);
       }
     } finally {
       timer = window.setTimeout(renderTick, LOCAL_TICK_MS);
@@ -461,27 +385,26 @@ async function runLocalSceneryRenderer(): Promise<void> {
     runtime = next;
 
     if (!next || next.runState === "stopped") {
-      await clearRenderer();
+      stopInteraction();
       return;
     }
 
     const previousLayerSignature =
       previous?.layers
-        .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}:${layer.baseZ}:${layer.multiplier}`)
+        .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}:${layer.multiplier}`)
         .join("|") ?? "";
     const nextLayerSignature = next.layers
-      .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}:${layer.baseZ}:${layer.multiplier}`)
+      .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}:${layer.multiplier}`)
       .join("|");
 
-    if (layers.length === 0 || !sceneryInteraction || previousLayerSignature !== nextLayerSignature) {
+    if (!manager || entries.length === 0 || previousLayerSignature !== nextLayerSignature) {
       await rebuild(next);
     }
   }
 
-  await cleanupLocalScenery();
   if (await OBR.scene.isReady()) {
     try {
-      await reportDiagnostic(-1, "boot", "Background interaction renderer is loaded and ready.", 0);
+      await reportDiagnostic(-1, "boot", "Background shared-item interaction renderer is loaded.", 0);
     } catch {}
     await sync(await OBR.scene.getMetadata());
   }
@@ -509,7 +432,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
       if (!ready) {
         runtime = null;
         lastRuntimePollSignature = "";
-        await clearRenderer();
+        stopInteraction();
         return;
       }
       const metadata = await OBR.scene.getMetadata();
@@ -519,6 +442,7 @@ async function runLocalSceneryRenderer(): Promise<void> {
     })();
   });
 
+  void timer;
   void healthTimer;
   void runtimePollTimer;
   void writeBackgroundHeartbeat();
@@ -584,7 +508,7 @@ type SavedSettings = {
 };
 
 if (backgroundMode) {
-  OBR.onReady(() => void runLocalSceneryRenderer());
+  OBR.onReady(() => void runSharedInteractionRenderer());
 } else {
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div style="font-family: Arial, sans-serif; padding: 14px;">
@@ -807,7 +731,7 @@ OBR.onReady(async () => {
         ? `ONLINE${health?.sceneReady ? " / scene ready" : " / waiting for scene"}`
         : "OFFLINE";
       const diagText = diagnostic
-        ? ` | stage: ${diagnostic.stage}${diagnostic.cloneCount ? ` (${diagnostic.cloneCount} clones)` : ""}`
+        ? ` | stage: ${diagnostic.stage}${diagnostic.itemCount ? ` (${diagnostic.itemCount} items)` : ""}`
         : " | stage: none";
       rendererHealth.textContent = `Background renderer: ${healthText}${diagText}`;
     } catch (error) {
@@ -2003,7 +1927,7 @@ OBR.onReady(async () => {
     }
 
     try {
-      status.textContent = "Preparing local-interaction chase...";
+      status.textContent = "Preparing background interaction chase...";
       await prepareChase();
       await OBR.player.deselect();
       if (focusOnStartCheckbox.checked) await goToAnchor();
@@ -2034,10 +1958,10 @@ OBR.onReady(async () => {
         diagnostic = await readRendererDiagnostic();
         if (diagnostic?.revision === expectedRevision) {
           if (diagnostic.stage === "error") {
-            throw new Error(`Local renderer error: ${diagnostic.message}`);
+            throw new Error(`Background interaction renderer error: ${diagnostic.message}`);
           }
           if (diagnostic.stage === "moving") break;
-          status.textContent = `Starting interaction renderer: ${diagnostic.stage} (${diagnostic.cloneCount} clones)...`;
+          status.textContent = `Starting renderer: ${diagnostic.stage} (${diagnostic.itemCount} items)...`;
         }
         await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
       }
@@ -2049,9 +1973,7 @@ OBR.onReady(async () => {
         );
       }
 
-      // Now that the client-local renderer has proven it can advance scenery,
-      // hide the shared source images and reveal the moving local copies beneath.
-      await setSourceVisibility(false);
+      // The renderer is interacting with the real shared scene items, so they remain visible.
 
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
@@ -2067,8 +1989,8 @@ OBR.onReady(async () => {
       ].filter(Boolean);
       status.textContent =
         extras.length > 0
-          ? `Local-interaction chase running with ${extras.join(", ")}.`
-          : "Local-interaction parallax chase running!";
+          ? `Background interaction chase running with ${extras.join(", ")}.`
+          : "Background interaction parallax chase running!";
     } catch (error) {
       if (runtimeState) {
         try {
@@ -2086,8 +2008,7 @@ OBR.onReady(async () => {
         } catch {}
       }
       try {
-        // Shared scenery is intentionally not hidden until the renderer proves
-        // it is moving, but force visibility here as a final safety net.
+        // Shared scenery should remain visible in this architecture; force visibility as a safety net.
         await setSourceVisibility(true);
       } catch (restoreError) {
         console.error("Could not restore shared scenery after startup failure:", restoreError);
