@@ -22,6 +22,8 @@ const BACKGROUND_HEALTH_KEY = "com.supercalfrag.minecart-scroll/background-healt
 const LOCAL_TICK_MS = 20; // 50fps target for the background shared-item interaction renderer.
 const MAX_INTERNAL_SPEED = 1500; // 50 ft/s on a 5 ft / 150 DPI scene.
 const MAX_INTERNAL_ACCELERATION = 1000;
+const SUBTLE_GM_INTERACTION_COLOR = "#64748B"; // muted slate
+const SUBTLE_CAST_INTERACTION_COLOR = "#6B7280"; // muted charcoal
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 type RuntimeLayerSpec = {
@@ -221,6 +223,47 @@ async function runSharedInteractionRenderer(): Promise<void> {
   let lastRuntimePollSignature = "";
   let reportedMovingRevision = -1;
   let reportedErrorRevision = -1;
+  let originalPlayerColor: string | null = null;
+  let interactionColorApplied = false;
+
+  async function applySubtleInteractionColor(): Promise<void> {
+    if (interactionColorApplied) return;
+    try {
+      const [role, name, currentColor] = await Promise.all([
+        OBR.player.getRole(),
+        OBR.player.getName(),
+        OBR.player.getColor(),
+      ]);
+      const normalizedName = name.trim().toLowerCase();
+      const targetColor =
+        role === "GM"
+          ? SUBTLE_GM_INTERACTION_COLOR
+          : normalizedName === "cast"
+            ? SUBTLE_CAST_INTERACTION_COLOR
+            : null;
+      if (!targetColor) return;
+      originalPlayerColor = currentColor;
+      interactionColorApplied = true;
+      if (currentColor.toLowerCase() !== targetColor.toLowerCase()) {
+        await OBR.player.setColor(targetColor);
+      }
+    } catch (error) {
+      console.error("Minecart Scroll could not apply subtle interaction color:", error);
+    }
+  }
+
+  async function restorePlayerColor(): Promise<void> {
+    if (!interactionColorApplied) return;
+    const restoreColor = originalPlayerColor;
+    originalPlayerColor = null;
+    interactionColorApplied = false;
+    if (!restoreColor) return;
+    try {
+      await OBR.player.setColor(restoreColor);
+    } catch (error) {
+      console.error("Minecart Scroll could not restore player color:", error);
+    }
+  }
   async function reportDiagnostic(
     revision: number,
     stage: RendererDiagnosticStage,
@@ -281,6 +324,7 @@ async function runSharedInteractionRenderer(): Promise<void> {
         }
       }
       if (interactionImages.length === 0) throw new Error("No shared scenery items were available for the renderer.");
+      await applySubtleInteractionColor();
       const [update, stop] = await OBR.interaction.startItemInteraction(interactionImages);
       manager = {
         update: update as SharedInteractionManager["update"],
@@ -297,6 +341,7 @@ async function runSharedInteractionRenderer(): Promise<void> {
       );
     } catch (error) {
       stopInteraction();
+      await restorePlayerColor();
       const message = error instanceof Error ? error.message : "Could not open the shared scenery interaction.";
       console.error("Minecart Scroll shared interaction renderer rebuild failed:", error);
       try {
@@ -363,6 +408,7 @@ async function runSharedInteractionRenderer(): Promise<void> {
 
     if (!next || next.runState === "stopped") {
       stopInteraction();
+      await restorePlayerColor();
       return;
     }
     const previousLayerSignature =
@@ -412,6 +458,7 @@ async function runSharedInteractionRenderer(): Promise<void> {
         runtime = null;
         lastRuntimePollSignature = "";
         stopInteraction();
+        await restorePlayerColor();
         return;
       }
       const metadata = await OBR.scene.getMetadata();
@@ -423,6 +470,11 @@ async function runSharedInteractionRenderer(): Promise<void> {
   void timer;
   void healthTimer;
   void runtimePollTimer;
+  window.addEventListener("beforeunload", () => {
+    if (interactionColorApplied && originalPlayerColor) {
+      void OBR.player.setColor(originalPlayerColor);
+    }
+  });
   void writeBackgroundHeartbeat();
   void pollRuntimeState();
   renderTick();
@@ -890,13 +942,13 @@ OBR.onReady(async () => {
     applyAcceleration(feetPerSecondToInternalSpeed(value));
   }
   function applyFloorMultiplier(percent: number): void {
-    const value = clampNumber(percent, 0, 100, 45);
+    const value = clampNumber(percent, 0, 100, 10);
     floorMultiplier = value / 100;
     floorMultiplierSlider.value = String(value);
     floorMultiplierValue.textContent = String(Math.round(value));
   }
   function applyBackgroundMultiplier(percent: number): void {
-    const value = clampNumber(percent, 0, 100, 40);
+    const value = clampNumber(percent, 0, 100, 10);
     backgroundMultiplier = value / 100;
     backgroundMultiplierSlider.value = String(value);
     backgroundMultiplierValue.textContent = String(Math.round(value));
