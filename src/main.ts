@@ -14,6 +14,7 @@ const LAYER_RENEW_FIRST_DELAY_MS: Record<string, number> = {
   Foreground: 25000,
 };
 const MINECART_DROP_SETTLE_MS = 250;
+const MINECART_RATTLE_TICK_MS = 60; // ~16.7 updates/sec: smoother network behavior while preserving visible vibration.
 
 const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v41";
 const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v41";
@@ -594,7 +595,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <legend><strong>Minecart Rattle</strong></legend>
         <label>
           <input id="rattleEnabledCheckbox" type="checkbox" checked>
-          Enable independent vertical rattle
+          Enable minecart rattle (turn OFF for free movement)
         </label>
         <br><br>
         <label>Rattle Strength: <strong><span id="rattleStrengthValue">100</span>%</strong></label>
@@ -744,6 +745,7 @@ OBR.onReady(async () => {
   let minecartDropTimer = 0;
   let lastObservedMinecartX = 0;
   let lastObservedMinecartY = 0;
+  let lastMinecartRattleUpdateMs = 0;
 
   let animationFrame = 0;
   let renewing = false;
@@ -929,7 +931,12 @@ OBR.onReady(async () => {
     applyForegroundMultiplier(Number(foregroundMultiplierSlider.value));
     if (runState !== "stopped") void updateRuntimeLayerMultipliers();
   });
-  rattleEnabledCheckbox.addEventListener("change", readControls);
+  rattleEnabledCheckbox.addEventListener("change", () => {
+    void handleRattleToggle().catch((error) => {
+      console.error("Could not change minecart rattle mode:", error);
+      status.textContent = error instanceof Error ? error.message : "Could not change minecart rattle mode.";
+    });
+  });
   rattleStrengthSlider.addEventListener("input", () => {
     rattleStrengthValue.textContent = rattleStrengthSlider.value;
     readControls();
@@ -1452,6 +1459,57 @@ OBR.onReady(async () => {
       }
     });
   }
+  async function rebaseMinecartsFromScene(): Promise<void> {
+    if (!activeMinecarts) return;
+    const ids = activeMinecarts.images.map((image) => image.id);
+    const refreshed = await OBR.scene.items.getItems(ids);
+    const refreshedImages = refreshed.filter(isImage);
+    if (refreshedImages.length !== ids.length) {
+      throw new Error("One or more minecart images disappeared from the scene.");
+    }
+
+    for (const image of refreshedImages) {
+      const cart = activeMinecarts.states.get(image.id);
+      if (!cart) continue;
+      cart.baseX = image.position.x;
+      cart.baseY = image.position.y;
+      cart.offsetY = 0;
+    }
+    activeMinecarts.images = refreshedImages;
+  }
+
+  async function handleRattleToggle(): Promise<void> {
+    const wasEnabled = rattleEnabled;
+    readControls();
+    if (wasEnabled === rattleEnabled || !activeMinecarts) return;
+
+    clearMinecartDropTimer();
+    draggedMinecartId = null;
+    minecartRattleSuspended = false;
+    lastMinecartRattleUpdateMs = 0;
+
+    if (!rattleEnabled) {
+      // If the chase is active, do one final settle write and then completely
+      // release the minecart items. While OFF there are no position writes.
+      closeMinecartInteraction();
+      if (runState === "running") await resetMinecarts();
+      status.textContent = "Rattle OFF — minecarts released for normal Owlbear movement.";
+      return;
+    }
+
+    // Whatever positions the GM moved the carts to while OFF become the new
+    // stable centers. This also works while paused, so Resume cannot snap carts
+    // back to pre-move coordinates.
+    await rebaseMinecartsFromScene();
+    draggedMinecartId = [...selectedItemIds].find((id) => activeMinecarts?.states.has(id)) ?? null;
+    minecartRattleSuspended = draggedMinecartId !== null;
+    if (runState === "running") await openMinecartInteraction();
+    status.textContent = draggedMinecartId
+      ? "Rattle ON — current cart positions captured; selected cart remains released until deselected."
+      : runState === "paused"
+        ? "Rattle ON — current cart positions captured; rattle will resume from here when the chase resumes."
+        : "Rattle ON — current cart positions captured as the new rattle centers.";
+  }
   function clearMinecartDropTimer(): void {
     if (minecartDropTimer) window.clearTimeout(minecartDropTimer);
     minecartDropTimer = 0;
@@ -1477,7 +1535,7 @@ OBR.onReady(async () => {
   }
 
   async function createMinecartInteraction(): Promise<InteractionManager | null> {
-    if (!activeMinecarts || runState !== "running") return null;
+    if (!activeMinecarts || runState !== "running" || !rattleEnabled) return null;
 
     const ids = activeMinecarts.images
       .map((image) => image.id)
@@ -1548,7 +1606,7 @@ OBR.onReady(async () => {
       lastObservedMinecartY = item.position.y;
       draggedMinecartId = null;
       minecartRattleSuspended = false;
-      if (runState === "running" && !renewing) await openMinecartInteraction();
+      if (runState === "running" && !renewing && rattleEnabled) await openMinecartInteraction();
     } catch (error) {
       console.error("Could not capture dropped minecart:", error);
     }
@@ -1564,7 +1622,7 @@ OBR.onReady(async () => {
   selectedItemIds = new Set((await OBR.player.getSelection()) ?? []);
   OBR.player.onChange((player) => {
     const nextSelection = new Set<string>(player.selection ?? []);
-    if (activeMinecarts && runState === "running") {
+    if (activeMinecarts && runState === "running" && rattleEnabled) {
       for (const id of nextSelection) {
         if (!selectedItemIds.has(id) && activeMinecarts.states.has(id)) {
           draggedMinecartId = id;
@@ -1589,7 +1647,7 @@ OBR.onReady(async () => {
     selectedItemIds = nextSelection;
   });
   OBR.scene.items.onChange((items) => {
-    if (!activeMinecarts || !minecartRattleSuspended || !draggedMinecartId) return;
+    if (!activeMinecarts || !rattleEnabled || !minecartRattleSuspended || !draggedMinecartId) return;
 
     const item = items.find((candidate) => candidate.id === draggedMinecartId);
     if (!item || !isImage(item)) return;
@@ -1701,13 +1759,14 @@ OBR.onReady(async () => {
       if (animationFrame) cancelAnimationFrame(animationFrame);
       animationFrame = 0;
       closeMinecartInteraction();
-      await resetMinecarts();
+      if (rattleEnabled) await resetMinecarts();
       return;
     }
-    if (runState === "running" && activeMinecarts) {
+    if (runState === "running") {
       try {
-        await openMinecartInteraction();
+        if (activeMinecarts && rattleEnabled) await openMinecartInteraction();
         lastTime = performance.now();
+        lastMinecartRattleUpdateMs = 0;
         if (!animationFrame) animationFrame = requestAnimationFrame(animate);
       } catch (error) {
         console.error("Could not resume minecart rattle after reopening panel:", error);
@@ -1748,8 +1807,15 @@ OBR.onReady(async () => {
       : { distance: 0, speed: 0 };
     currentSpeed = snapshot.speed;
     currentSpeedValue.textContent = speedScaleReady ? formatFeetPerSecondFromInternal(currentSpeed) : "0.0";
-    updateMinecartRattle(time / 1000);
-    if (minecartInteractionUpdate && activeMinecarts) {
+
+    if (
+      rattleEnabled &&
+      minecartInteractionUpdate &&
+      activeMinecarts &&
+      (lastMinecartRattleUpdateMs === 0 || time - lastMinecartRattleUpdateMs >= MINECART_RATTLE_TICK_MS)
+    ) {
+      lastMinecartRattleUpdateMs = time;
+      updateMinecartRattle(time / 1000);
       minecartInteractionUpdate((draft) => {
         const items = Array.isArray(draft) ? draft : [draft];
         for (const item of items) {
@@ -1882,14 +1948,15 @@ OBR.onReady(async () => {
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
       runState = "running";
-      await openMinecartInteraction();
+      if (rattleEnabled) await openMinecartInteraction();
       lastTime = performance.now();
+      lastMinecartRattleUpdateMs = 0;
       animationFrame = requestAnimationFrame(animate);
       updateRunButtons();
       const extras = [
         activeFloor ? "floor" : "",
         activeForeground ? "foreground" : "",
-        activeMinecarts ? "minecart rattle" : "",
+        activeMinecarts && rattleEnabled ? "minecart rattle" : "",
       ].filter(Boolean);
       status.textContent =
         extras.length > 0
@@ -1951,7 +2018,7 @@ OBR.onReady(async () => {
     };
     await writeRuntimeState(runtimeState);
     closeMinecartInteraction();
-    await resetMinecarts();
+    if (rattleEnabled) await resetMinecarts();
     currentSpeed = 0;
     currentSpeedValue.textContent = "0.0";
     runState = "paused";
@@ -1978,8 +2045,9 @@ OBR.onReady(async () => {
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
       runState = "running";
-      await openMinecartInteraction();
+      if (rattleEnabled) await openMinecartInteraction();
       lastTime = performance.now();
+      lastMinecartRattleUpdateMs = 0;
       animationFrame = requestAnimationFrame(animate);
       updateRunButtons();
       status.textContent = "Resumed — local renderer accelerating back to target speed.";
@@ -2001,7 +2069,7 @@ OBR.onReady(async () => {
     clearMinecartDropTimer();
     draggedMinecartId = null;
     minecartRattleSuspended = false;
-    await resetMinecarts();
+    if (rattleEnabled) await resetMinecarts();
     // Restore the shared scenery exactly where the local renderer finished.
     await commitRuntimeSources(runtimeState, snapshot.distance, true);
     runtimeState = {
@@ -2035,7 +2103,7 @@ OBR.onReady(async () => {
     clearMinecartDropTimer();
     draggedMinecartId = null;
     minecartRattleSuspended = false;
-    await resetMinecarts();
+    if (rattleEnabled) await resetMinecarts();
     const runtime = runtimeState ?? (await readRuntimeState());
     if (runtime) {
       await commitRuntimeSources(runtime, 0, true, false);
@@ -2080,9 +2148,10 @@ OBR.onReady(async () => {
     try {
       const minecartImages = await getMinecartImages(minecartIds);
       activeMinecarts = prepareMinecarts(minecartImages);
-      if (runState === "running" && activeMinecarts) {
-        await openMinecartInteraction();
+      if (runState === "running") {
+        if (activeMinecarts && rattleEnabled) await openMinecartInteraction();
         lastTime = performance.now();
+        lastMinecartRattleUpdateMs = 0;
         animationFrame = requestAnimationFrame(animate);
       }
     } catch (error) {
