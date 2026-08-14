@@ -27,7 +27,9 @@ const SUBTLE_CAST_INTERACTION_COLOR = "#6B7280"; // muted charcoal
 const CRASH_STATE_KEY = "com.supercalfrag.minecart-scroll/crash-state-v2";
 const CRASH_CHANNEL = "com.supercalfrag.minecart-scroll/crash-control-v1";
 const CRASH_POPOVER_ID = "com.supercalfrag.minecart-scroll/crash-warning";
-const CRASH_FALL_MS = 4300; // cinematic hundreds-of-feet freefall.
+const CRASH_WALL_RICOCHET_MS = 900;
+const CRASH_300FT_FALL_MS = 4320; // ~300 ft freefall under Earth gravity.
+const CRASH_FLOOR_IMPACT_MS = 150;
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 type RuntimeLayerSpec = {
@@ -219,12 +221,13 @@ type CrashHome = {
 };
 
 type CrashRuntimeState = {
-  version: 2;
+  version: 3;
   chaseRevision: number;
   brokenCartId: string;
   minecartIds: string[];
   track1Y: number;
   track2Y: number;
+  floorImpactY: number;
   status: "armed" | "running" | "complete";
   brokenHome: CrashHome;
   cartHomes: CrashHome[];
@@ -236,12 +239,13 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Partial<CrashRuntimeState>;
   if (
-    value.version !== 2 ||
+    value.version !== 3 ||
     typeof value.chaseRevision !== "number" ||
     typeof value.brokenCartId !== "string" ||
     !Array.isArray(value.minecartIds) ||
     !Number.isFinite(value.track1Y) ||
     !Number.isFinite(value.track2Y) ||
+    !Number.isFinite(value.floorImpactY) ||
     (value.status !== "armed" && value.status !== "running" && value.status !== "complete") ||
     !value.brokenHome ||
     typeof value.brokenHome !== "object" ||
@@ -295,12 +299,13 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
     value.crashedTrack === 1 || value.crashedTrack === 2 ? value.crashedTrack : null;
 
   return {
-    version: 2,
+    version: 3,
     chaseRevision: value.chaseRevision,
     brokenCartId: value.brokenCartId,
     minecartIds: value.minecartIds.filter((id): id is string => typeof id === "string"),
     track1Y: Number(value.track1Y),
     track2Y: Number(value.track2Y),
+    floorImpactY: Number(value.floorImpactY),
     status: value.status,
     brokenHome: {
       id: broken.id,
@@ -385,11 +390,10 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
 
   const sortedCarts = [...carts].sort((a, b) => b.position.x - a.position.x);
   const frontCart = sortedCarts[0];
-  const [frontBounds, brokenBounds, viewportWidth, viewportHeight] = await Promise.all([
+  const [frontBounds, brokenBounds, viewportWidth] = await Promise.all([
     OBR.scene.items.getItemBounds([frontCart.id]),
     OBR.scene.items.getItemBounds([broken.id]),
     OBR.viewport.getWidth(),
-    OBR.viewport.getHeight(),
   ]);
   const frontScreen = await OBR.viewport.transformPoint({ x: frontCart.position.x, y: targetY });
   const spawnPoint = await OBR.viewport.inverseTransformPoint({
@@ -460,34 +464,22 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
       startRotation: number;
       startScaleX: number;
       startScaleY: number;
-      direction: 1 | -1;
-      sideKick: number;
-      horizontalDrift: number;
-      fallDistance: number;
+      wallOffset: number;
+      openLaunchOffset: number;
+      floorY: number;
       spinDegrees: number;
       endScaleFactor: number;
+      momentumDecayPower: number;
+      impactJolt: number;
     };
 
-    const centerScreen = await OBR.viewport.transformPoint({ x: frontCart.position.x, y: targetY });
-    const lowerWorld = await OBR.viewport.inverseTransformPoint({
-      x: centerScreen.x,
-      y: Math.min(viewportHeight + 200, centerScreen.y + viewportHeight * 0.92),
-    });
-    const upperWorld = await OBR.viewport.inverseTransformPoint({
-      x: centerScreen.x,
-      y: Math.max(-200, centerScreen.y - viewportHeight * 0.92),
-    });
-    const screenFallDistance = Math.max(
-      300,
-      Math.abs(lowerWorld.y - targetY),
-      Math.abs(upperWorld.y - targetY),
-    );
-
+    const trackGap = Math.abs(state.track1Y - state.track2Y);
+    const baseWallOffset = Math.max(44, Math.min(105, trackGap * 0.28));
+    const baseOpenLaunchOffset = Math.max(70, Math.min(150, trackGap * 0.42));
     const profiles = new Map<string, FallProfile>();
 
     sortedCarts.forEach((cart, index) => {
       const seed = crashSeed(cart.id);
-      const direction: 1 | -1 = index % 2 === 0 ? 1 : -1;
       const frontBias = Math.max(0, 2 - index);
       profiles.set(cart.id, {
         id: cart.id,
@@ -496,17 +488,17 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
         startRotation: cart.rotation,
         startScaleX: cart.scale.x,
         startScaleY: cart.scale.y,
-        direction,
-        sideKick: 55 + seed * 85 + frontBias * 28,
-        horizontalDrift: -(70 + seed * 90 + index * 22),
-        fallDistance: screenFallDistance * (0.82 + seed * 0.42),
-        spinDegrees: direction * (720 + seed * 1080 + frontBias * 180),
-        endScaleFactor: 0.18 + seed * 0.09,
+        wallOffset: baseWallOffset * (0.88 + seed * 0.24) + frontBias * 8,
+        openLaunchOffset: baseOpenLaunchOffset * (0.9 + seed * 0.2),
+        floorY: state.floorImpactY + (seed - 0.5) * 70,
+        spinDegrees: (seed > 0.5 ? 1 : -1) * (900 + seed * 1080 + frontBias * 180),
+        endScaleFactor: 0.38 + seed * 0.09,
+        momentumDecayPower: 1.35 + seed * 1.15,
+        impactJolt: (seed > 0.5 ? 1 : -1) * (12 + seed * 18),
       });
     });
 
     const brokenSeed = crashSeed(broken.id);
-    const brokenDirection: 1 | -1 = sortedCarts.length % 2 === 0 ? -1 : 1;
     profiles.set(broken.id, {
       id: broken.id,
       startX: impactX,
@@ -514,24 +506,51 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
       startRotation: baseBrokenRotation,
       startScaleX: broken.scale.x,
       startScaleY: broken.scale.y,
-      direction: brokenDirection,
-      sideKick: 80 + brokenSeed * 90,
-      horizontalDrift: -(110 + brokenSeed * 120),
-      fallDistance: screenFallDistance * (0.9 + brokenSeed * 0.35),
-      spinDegrees: brokenDirection * (900 + brokenSeed * 1260),
-      endScaleFactor: 0.17 + brokenSeed * 0.08,
+      wallOffset: baseWallOffset * (1.04 + brokenSeed * 0.2),
+      openLaunchOffset: baseOpenLaunchOffset * (1.02 + brokenSeed * 0.18),
+      floorY: state.floorImpactY + (brokenSeed - 0.5) * 80,
+      spinDegrees: (brokenSeed > 0.5 ? 1 : -1) * (1080 + brokenSeed * 1260),
+      endScaleFactor: 0.36 + brokenSeed * 0.08,
+      momentumDecayPower: 1.45 + brokenSeed,
+      impactJolt: (brokenSeed > 0.5 ? 1 : -1) * (16 + brokenSeed * 20),
     });
 
+    let previousChaseDistance = motionAt(chaseRuntime.motion, Date.now()).distance;
+    const relativeX = new Map<string, number>();
+    for (const id of profiles.keys()) relativeX.set(id, 0);
+
+    const applyBackScroll = (fallProgress: number | null) => {
+      const chaseNow = motionAt(chaseRuntime.motion, Date.now());
+      const chaseDelta = Math.max(0, chaseNow.distance - previousChaseDistance);
+      previousChaseDistance = chaseNow.distance;
+      if (chaseDelta <= 0) return;
+
+      for (const [id, profile] of profiles) {
+        const retention =
+          fallProgress === null
+            ? 1
+            : Math.pow(Math.max(0, 1 - fallProgress), profile.momentumDecayPower);
+        relativeX.set(
+          id,
+          (relativeX.get(id) ?? 0) - chaseDelta * (1 - retention),
+        );
+      }
+    };
+
+    // Slam/scrape against the wall BELOW the rails, then ricochet across
+    // the track and over the OPEN side ABOVE the rails.
     await new Promise<void>((resolve) => {
       const startedAt = performance.now();
       const tick = (now: number) => {
-        const elapsedMs = now - startedAt;
-        const raw = Math.min(1, elapsedMs / CRASH_FALL_MS);
-        const kickProgress = Math.min(1, elapsedMs / 320);
-        const kickEase = crashEaseOut(kickProgress);
-        const gravityProgress = raw * raw;
-        const driftProgress = raw;
-        const depthProgress = Math.pow(raw, 1.15);
+        const raw = Math.min(1, (now - startedAt) / CRASH_WALL_RICOCHET_MS);
+        applyBackScroll(null);
+
+        const redirectProgress =
+          raw <= 0.63 ? 0 : crashEaseOut((raw - 0.63) / 0.37);
+        const wallBounce =
+          Math.abs(Math.sin(raw * Math.PI * 2.15)) *
+          (1 - raw * 0.52) *
+          (1 - redirectProgress);
 
         update((draft) => {
           const items = Array.isArray(draft) ? draft : [draft];
@@ -539,16 +558,56 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
             const profile = profiles.get(item.id);
             if (!profile) continue;
 
-            item.position.x =
-              profile.startX + profile.horizontalDrift * driftProgress;
+            item.position.x = profile.startX + (relativeX.get(item.id) ?? 0);
             item.position.y =
               profile.startY +
-              profile.direction * (
-                profile.sideKick * kickEase +
-                profile.fallDistance * gravityProgress
-              );
+              profile.wallOffset * wallBounce -
+              profile.openLaunchOffset * redirectProgress;
             item.rotation =
-              profile.startRotation + profile.spinDegrees * raw;
+              profile.startRotation +
+              profile.spinDegrees * raw * 0.12;
+          }
+        });
+
+        if (raw >= 1) resolve();
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+
+    const edgeState = new Map<string, { x: number; y: number; rotation: number }>();
+    for (const [id, profile] of profiles) {
+      edgeState.set(id, {
+        x: profile.startX + (relativeX.get(id) ?? 0),
+        y: profile.startY - profile.openLaunchOffset,
+        rotation: profile.startRotation + profile.spinDegrees * 0.12,
+      });
+    }
+
+    // ~4.32 seconds = approximately 300 ft of freefall under Earth gravity.
+    // The cart retains forward momentum at first, then increasingly scrolls
+    // backward with the map as that momentum is lost.
+    await new Promise<void>((resolve) => {
+      const startedAt = performance.now();
+      const tick = (now: number) => {
+        const raw = Math.min(1, (now - startedAt) / CRASH_300FT_FALL_MS);
+        applyBackScroll(raw);
+
+        const gravityProgress = raw * raw;
+        const depthProgress = Math.pow(raw, 1.08);
+
+        update((draft) => {
+          const items = Array.isArray(draft) ? draft : [draft];
+          for (const item of items) {
+            const profile = profiles.get(item.id);
+            const edge = edgeState.get(item.id);
+            if (!profile || !edge) continue;
+
+            item.position.x = edge.x + (relativeX.get(item.id) ?? 0);
+            item.position.y =
+              edge.y + (profile.floorY - edge.y) * gravityProgress;
+            item.rotation =
+              edge.rotation + profile.spinDegrees * 0.88 * raw;
 
             const scaleFactor =
               1 - (1 - profile.endScaleFactor) * depthProgress;
@@ -563,20 +622,52 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
       requestAnimationFrame(tick);
     });
 
+    // Floor impact after the 300-ft fall: quick squash/jolt, then disappear.
+    await new Promise<void>((resolve) => {
+      const startedAt = performance.now();
+      const tick = (now: number) => {
+        const raw = Math.min(1, (now - startedAt) / CRASH_FLOOR_IMPACT_MS);
+        const pulse = Math.sin(raw * Math.PI);
+
+        update((draft) => {
+          const items = Array.isArray(draft) ? draft : [draft];
+          for (const item of items) {
+            const profile = profiles.get(item.id);
+            const edge = edgeState.get(item.id);
+            if (!profile || !edge) continue;
+
+            item.position.x = edge.x + (relativeX.get(item.id) ?? 0);
+            item.position.y = profile.floorY;
+            item.rotation =
+              edge.rotation +
+              profile.spinDegrees * 0.88 +
+              profile.impactJolt * pulse;
+            item.scale.x =
+              profile.startScaleX * profile.endScaleFactor * (1 + pulse * 0.22);
+            item.scale.y =
+              profile.startScaleY * profile.endScaleFactor * (1 - pulse * 0.18);
+          }
+        });
+
+        if (raw >= 1) resolve();
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+
     stop();
 
     await OBR.scene.items.updateItems([broken.id, ...carts.map((cart) => cart.id)], (items) => {
       for (const item of items) {
         const profile = profiles.get(item.id);
-        if (!profile) continue;
-        item.visible = true;
-        item.position.x = profile.startX + profile.horizontalDrift;
-        item.position.y =
-          profile.startY +
-          profile.direction * (profile.sideKick + profile.fallDistance);
-        item.rotation = profile.startRotation + profile.spinDegrees;
+        const edge = edgeState.get(item.id);
+        if (!profile || !edge) continue;
+        item.position.x = edge.x + (relativeX.get(item.id) ?? 0);
+        item.position.y = profile.floorY;
+        item.rotation = edge.rotation + profile.spinDegrees * 0.88;
         item.scale.x = profile.startScaleX * profile.endScaleFactor;
         item.scale.y = profile.startScaleY * profile.endScaleFactor;
+        item.visible = false;
       }
     });
 
@@ -985,6 +1076,7 @@ type SavedSettings = {
   brokenCartId: string | null;
   crashTrack1Y: number | null;
   crashTrack2Y: number | null;
+  crashFloorY: number | null;
   anchorX: number;
   anchorY: number;
   floorYOffset: number;
@@ -1046,10 +1138,13 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="setCrashTrack1Button">Set Track 1 Position</button>
         <span id="crashTrack1Status">Not set</span><br><br>
         <button id="setCrashTrack2Button">Set Track 2 Position</button>
-        <span id="crashTrack2Status">Not set</span>
+        <span id="crashTrack2Status">Not set</span><br><br>
+        <button id="setCrashFloorButton">Set Floor Impact Position</button>
+        <span id="crashFloorStatus">Not set</span>
         <p style="font-size:12px;">
           Select one cart or image centered on each rail, then set its track position.
-          When ⚠ is clicked, only minecarts currently closest to the broken cart's rail will crash.
+          Select one image around the middle of the floor map and set the Floor Impact Position.
+          Wall side is below the rails; the open fall is above them.
         </p>
         <button id="resetCrashedMinecartsButton">Reset Last Crash</button>
         <span id="resetCrashStatus">No crash to reset</span>
@@ -1189,6 +1284,7 @@ OBR.onReady(async () => {
   const brokenCartStatus = document.querySelector<HTMLSpanElement>("#brokenCartStatus")!;
   const crashTrack1Status = document.querySelector<HTMLSpanElement>("#crashTrack1Status")!;
   const crashTrack2Status = document.querySelector<HTMLSpanElement>("#crashTrack2Status")!;
+  const crashFloorStatus = document.querySelector<HTMLSpanElement>("#crashFloorStatus")!;
   const resetCrashStatus = document.querySelector<HTMLSpanElement>("#resetCrashStatus")!;
   const setFloorButton = document.querySelector<HTMLButtonElement>("#setFloorButton")!;
   const setTrackButton = document.querySelector<HTMLButtonElement>("#setTrackButton")!;
@@ -1198,6 +1294,7 @@ OBR.onReady(async () => {
   const setBrokenCartButton = document.querySelector<HTMLButtonElement>("#setBrokenCartButton")!;
   const setCrashTrack1Button = document.querySelector<HTMLButtonElement>("#setCrashTrack1Button")!;
   const setCrashTrack2Button = document.querySelector<HTMLButtonElement>("#setCrashTrack2Button")!;
+  const setCrashFloorButton = document.querySelector<HTMLButtonElement>("#setCrashFloorButton")!;
   const resetCrashedMinecartsButton =
     document.querySelector<HTMLButtonElement>("#resetCrashedMinecartsButton")!;
   const saveButton = document.querySelector<HTMLButtonElement>("#saveButton")!;
@@ -1260,6 +1357,7 @@ OBR.onReady(async () => {
   let brokenCartId: string | null = null;
   let crashTrack1Y: number | null = null;
   let crashTrack2Y: number | null = null;
+  let crashFloorY: number | null = null;
 
   let anchorX = 0;
   let anchorY = 0;
@@ -1415,6 +1513,7 @@ OBR.onReady(async () => {
     brokenCartStatus.textContent = brokenCartId ? "1 image" : "Not set (optional)";
     crashTrack1Status.textContent = crashTrack1Y === null ? "Not set" : `Y ${Math.round(crashTrack1Y)}`;
     crashTrack2Status.textContent = crashTrack2Y === null ? "Not set" : `Y ${Math.round(crashTrack2Y)}`;
+    crashFloorStatus.textContent = crashFloorY === null ? "Not set" : `Y ${Math.round(crashFloorY)}`;
   }
   function updateRunButtons(): void {
     startButton.disabled = runState !== "stopped" || renewing;
@@ -1429,6 +1528,7 @@ OBR.onReady(async () => {
     setBrokenCartButton.disabled = runState !== "stopped";
     setCrashTrack1Button.disabled = runState !== "stopped";
     setCrashTrack2Button.disabled = runState !== "stopped";
+    setCrashFloorButton.disabled = runState !== "stopped";
     loadButton.disabled = runState !== "stopped";
   }
   function applyTargetSpeed(value: number): void {
@@ -1628,6 +1728,35 @@ OBR.onReady(async () => {
   setCrashTrack1Button.addEventListener("click", () => void setCrashTrackPosition(1));
   setCrashTrack2Button.addEventListener("click", () => void setCrashTrackPosition(2));
 
+  async function setCrashFloorPosition(): Promise<void> {
+    if (runState !== "stopped") {
+      status.textContent = "Stop the chase before changing the floor impact position.";
+      return;
+    }
+    const images = await getSelectedImages(1);
+    if (!images) return;
+    if (images.length !== 1) {
+      status.textContent = "Select exactly ONE image around the middle of the floor map.";
+      return;
+    }
+
+    const y = images[0].position.y;
+    const highestTrackY =
+      crashTrack1Y !== null && crashTrack2Y !== null
+        ? Math.min(crashTrack1Y, crashTrack2Y)
+        : null;
+    if (highestTrackY !== null && y >= highestTrackY) {
+      status.textContent = "Floor Impact Position should be ABOVE the tracks, on the open side.";
+      return;
+    }
+
+    crashFloorY = y;
+    updateLayerLabels();
+    await OBR.player.deselect();
+    status.textContent = `Floor impact position set at Y ${Math.round(y)}.`;
+  }
+  setCrashFloorButton.addEventListener("click", () => void setCrashFloorPosition());
+
   async function closeCrashWarningPopover(): Promise<void> {
     try {
       await OBR.popover.close(CRASH_POPOVER_ID);
@@ -1640,7 +1769,7 @@ OBR.onReady(async () => {
     await closeCrashWarningPopover();
     await OBR.popover.open({
       id: CRASH_POPOVER_ID,
-      url: `${window.location.pathname}?crashWarning=1&v=0.5.4`,
+      url: `${window.location.pathname}?crashWarning=1&v=0.5.5`,
       width: 64,
       height: 64,
       anchorReference: "POSITION",
@@ -1659,6 +1788,7 @@ OBR.onReady(async () => {
       !runtimeState ||
       crashTrack1Y === null ||
       crashTrack2Y === null ||
+      crashFloorY === null ||
       Math.abs(crashTrack1Y - crashTrack2Y) < 1
     ) {
       await closeCrashWarningPopover();
@@ -1671,12 +1801,13 @@ OBR.onReady(async () => {
     if (!broken || carts.length === 0) return false;
 
     const state: CrashRuntimeState = {
-      version: 2,
+      version: 3,
       chaseRevision: runtimeState.revision,
       brokenCartId,
       minecartIds: carts.map((cart) => cart.id),
       track1Y: crashTrack1Y,
       track2Y: crashTrack2Y,
+      floorImpactY: crashFloorY,
       status: "armed",
       brokenHome: {
         id: broken.id,
@@ -1811,6 +1942,7 @@ OBR.onReady(async () => {
       brokenCartId,
       crashTrack1Y,
       crashTrack2Y,
+      crashFloorY,
       anchorX,
       anchorY,
       floorYOffset,
@@ -1843,6 +1975,7 @@ OBR.onReady(async () => {
       brokenCartId: typeof value.brokenCartId === "string" ? value.brokenCartId : null,
       crashTrack1Y: Number.isFinite(value.crashTrack1Y) ? Number(value.crashTrack1Y) : null,
       crashTrack2Y: Number.isFinite(value.crashTrack2Y) ? Number(value.crashTrack2Y) : null,
+      crashFloorY: Number.isFinite(value.crashFloorY) ? Number(value.crashFloorY) : null,
       anchorX: Number.isFinite(value.anchorX) ? Number(value.anchorX) : 0,
       anchorY: Number.isFinite(value.anchorY) ? Number(value.anchorY) : 0,
       floorYOffset: clampNumber(Number(value.floorYOffset), -10000, 10000, 0),
@@ -1871,6 +2004,7 @@ OBR.onReady(async () => {
     brokenCartId = saved.brokenCartId;
     crashTrack1Y = saved.crashTrack1Y;
     crashTrack2Y = saved.crashTrack2Y;
+    crashFloorY = saved.crashFloorY;
     anchorXInput.value = String(saved.anchorX);
     anchorYInput.value = String(saved.anchorY);
     floorYOffsetInput.value = String(saved.floorYOffset);
@@ -2763,8 +2897,13 @@ OBR.onReady(async () => {
         extras.length > 0
           ? `Background interaction chase running with ${extras.join(", ")}.`
           : "Background interaction parallax chase running!";
-      if (brokenCartId && (!crashArmed) && (crashTrack1Y === null || crashTrack2Y === null)) {
-        status.textContent += " Broken-cart hazard needs Track 1 and Track 2 positions before it can arm.";
+      if (
+        brokenCartId &&
+        !crashArmed &&
+        (crashTrack1Y === null || crashTrack2Y === null || crashFloorY === null)
+      ) {
+        status.textContent +=
+          " Broken-cart hazard needs Track 1, Track 2, and Floor Impact positions before it can arm.";
       }
     } catch (error) {
       if (runtimeState) {
