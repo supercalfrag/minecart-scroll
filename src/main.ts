@@ -24,6 +24,11 @@ const MAX_INTERNAL_SPEED = 1500; // 50 ft/s on a 5 ft / 150 DPI scene.
 const MAX_INTERNAL_ACCELERATION = 1000;
 const SUBTLE_GM_INTERACTION_COLOR = "#64748B"; // muted slate
 const SUBTLE_CAST_INTERACTION_COLOR = "#6B7280"; // muted charcoal
+const CRASH_STATE_KEY = "com.supercalfrag.minecart-scroll/crash-state-v1";
+const CRASH_CHANNEL = "com.supercalfrag.minecart-scroll/crash-control-v1";
+const CRASH_POPOVER_ID = "com.supercalfrag.minecart-scroll/crash-warning";
+const CRASH_APPROACH_MS = 1800;
+const CRASH_IMPACT_MS = 900;
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 type RuntimeLayerSpec = {
@@ -201,6 +206,329 @@ function parseBackgroundHealth(raw: unknown): BackgroundHealth | null {
 async function readBackgroundHealth(): Promise<BackgroundHealth | null> {
   const metadata = await OBR.player.getMetadata();
   return parseBackgroundHealth(metadata[BACKGROUND_HEALTH_KEY]);
+}
+
+
+type CrashHome = {
+  id: string;
+  x: number;
+  y: number;
+  rotation: number;
+  visible: boolean;
+};
+
+type CrashRuntimeState = {
+  version: 1;
+  chaseRevision: number;
+  brokenCartId: string;
+  minecartIds: string[];
+  status: "armed" | "running" | "complete";
+  brokenHome: CrashHome;
+  cartHomes: CrashHome[];
+};
+
+function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Partial<CrashRuntimeState>;
+  if (
+    value.version !== 1 ||
+    typeof value.chaseRevision !== "number" ||
+    typeof value.brokenCartId !== "string" ||
+    !Array.isArray(value.minecartIds) ||
+    (value.status !== "armed" && value.status !== "running" && value.status !== "complete") ||
+    !value.brokenHome ||
+    typeof value.brokenHome !== "object" ||
+    !Array.isArray(value.cartHomes)
+  ) {
+    return null;
+  }
+
+  const broken = value.brokenHome as Partial<CrashHome>;
+  if (
+    typeof broken.id !== "string" ||
+    !Number.isFinite(broken.x) ||
+    !Number.isFinite(broken.y) ||
+    !Number.isFinite(broken.rotation) ||
+    typeof broken.visible !== "boolean"
+  ) {
+    return null;
+  }
+
+  const cartHomes: CrashHome[] = [];
+  for (const rawHome of value.cartHomes) {
+    if (!rawHome || typeof rawHome !== "object") continue;
+    const home = rawHome as Partial<CrashHome>;
+    if (
+      typeof home.id !== "string" ||
+      !Number.isFinite(home.x) ||
+      !Number.isFinite(home.y) ||
+      !Number.isFinite(home.rotation) ||
+      typeof home.visible !== "boolean"
+    ) {
+      continue;
+    }
+    cartHomes.push({
+      id: home.id,
+      x: Number(home.x),
+      y: Number(home.y),
+      rotation: Number(home.rotation),
+      visible: home.visible,
+    });
+  }
+
+  return {
+    version: 1,
+    chaseRevision: value.chaseRevision,
+    brokenCartId: value.brokenCartId,
+    minecartIds: value.minecartIds.filter((id): id is string => typeof id === "string"),
+    status: value.status,
+    brokenHome: {
+      id: broken.id,
+      x: Number(broken.x),
+      y: Number(broken.y),
+      rotation: Number(broken.rotation),
+      visible: broken.visible,
+    },
+    cartHomes,
+  };
+}
+
+async function readCrashRuntime(): Promise<CrashRuntimeState | null> {
+  if (!(await OBR.scene.isReady())) return null;
+  const metadata = await OBR.scene.getMetadata();
+  return parseCrashRuntime(metadata[CRASH_STATE_KEY]);
+}
+
+async function writeCrashRuntime(state: CrashRuntimeState): Promise<void> {
+  await OBR.scene.setMetadata({ [CRASH_STATE_KEY]: state });
+}
+
+function crashSeed(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 4294967295;
+}
+
+function crashEaseOut(value: number): number {
+  const t = Math.max(0, Math.min(1, value));
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function crashEaseInOut(value: number): number {
+  const t = Math.max(0, Math.min(1, value));
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+async function waitMs(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<void> {
+  const shared = await OBR.scene.items.getItems([state.brokenCartId, ...state.minecartIds]);
+  const byId = new Map(shared.filter(isImage).map((image) => [image.id, image] as const));
+  const broken = byId.get(state.brokenCartId);
+  const carts = state.minecartIds.map((id) => byId.get(id)).filter((image): image is Image => Boolean(image));
+  if (!broken) throw new Error("The designated Broken Cart could not be found.");
+  if (carts.length === 0) throw new Error("No player minecarts are available for the crash.");
+
+  const sortedCarts = [...carts].sort((a, b) => b.position.x - a.position.x);
+  const frontCart = sortedCarts[0];
+  const averageY = carts.reduce((sum, cart) => sum + cart.position.y, 0) / carts.length;
+  const [frontBounds, brokenBounds, viewportWidth] = await Promise.all([
+    OBR.scene.items.getItemBounds([frontCart.id]),
+    OBR.scene.items.getItemBounds([broken.id]),
+    OBR.viewport.getWidth(),
+  ]);
+  const frontScreen = await OBR.viewport.transformPoint({ x: frontCart.position.x, y: averageY });
+  const spawnPoint = await OBR.viewport.inverseTransformPoint({
+    x: viewportWidth + Math.max(100, brokenBounds.width * 0.75),
+    y: frontScreen.y,
+  });
+
+  const impactX = frontCart.position.x + Math.max(24, (frontBounds.width + brokenBounds.width) * 0.38);
+  const impactY = averageY;
+  const baseBrokenRotation = broken.rotation;
+
+  await OBR.scene.items.updateItems([broken.id], (items) => {
+    for (const item of items) {
+      item.visible = true;
+      item.position.x = spawnPoint.x;
+      item.position.y = impactY;
+      item.rotation = baseBrokenRotation;
+    }
+  });
+
+  const refreshed = await OBR.scene.items.getItems([broken.id, ...carts.map((cart) => cart.id)]);
+  const interactionImages = refreshed.filter(isImage);
+  const [update, stop] = await OBR.interaction.startItemInteraction(interactionImages);
+
+  try {
+    await new Promise<void>((resolve) => {
+      const startedAt = performance.now();
+      const tick = (now: number) => {
+        const raw = Math.min(1, (now - startedAt) / CRASH_APPROACH_MS);
+        const eased = crashEaseInOut(raw);
+        const x = spawnPoint.x + (impactX - spawnPoint.x) * eased;
+        const wobble = Math.sin(raw * Math.PI * 10) * (2 + raw * 6);
+        const bounce = Math.sin(raw * Math.PI * 7) * (2 + raw * 4);
+        update((draft) => {
+          const items = Array.isArray(draft) ? draft : [draft];
+          for (const item of items) {
+            if (item.id !== broken.id) continue;
+            item.position.x = x;
+            item.position.y = impactY + bounce;
+            item.rotation = baseBrokenRotation + wobble;
+          }
+        });
+        if (raw >= 1) resolve();
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+
+    const starts = new Map(
+      carts.map((cart) => [cart.id, { x: cart.position.x, y: cart.position.y, rotation: cart.rotation }] as const),
+    );
+    const finals = new Map<string, { x: number; y: number; rotation: number }>();
+    sortedCarts.forEach((cart, index) => {
+      const seed = crashSeed(cart.id);
+      const direction = index % 2 === 0 ? 1 : -1;
+      const start = starts.get(cart.id)!;
+      finals.set(cart.id, {
+        x: start.x - (45 + seed * 35 + index * 18),
+        y: start.y + direction * (95 + seed * 75 + Math.max(0, 2 - index) * 18),
+        rotation: start.rotation + direction * (22 + seed * 34),
+      });
+    });
+
+    const brokenFinal = {
+      x: impactX - Math.max(55, brokenBounds.width * 0.35),
+      y: impactY - Math.max(70, brokenBounds.height * 0.45),
+      rotation: baseBrokenRotation - 48,
+    };
+
+    await new Promise<void>((resolve) => {
+      const startedAt = performance.now();
+      const tick = (now: number) => {
+        const raw = Math.min(1, (now - startedAt) / CRASH_IMPACT_MS);
+        const eased = crashEaseOut(raw);
+        update((draft) => {
+          const items = Array.isArray(draft) ? draft : [draft];
+          for (const item of items) {
+            if (item.id === broken.id) {
+              item.position.x = impactX + (brokenFinal.x - impactX) * eased;
+              item.position.y = impactY + (brokenFinal.y - impactY) * eased;
+              item.rotation = baseBrokenRotation + (brokenFinal.rotation - baseBrokenRotation) * eased;
+              continue;
+            }
+            const start = starts.get(item.id);
+            const final = finals.get(item.id);
+            if (!start || !final) continue;
+            item.position.x = start.x + (final.x - start.x) * eased;
+            item.position.y = start.y + (final.y - start.y) * eased;
+            item.rotation = start.rotation + (final.rotation - start.rotation) * eased;
+          }
+        });
+        if (raw >= 1) resolve();
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+
+    stop();
+    await OBR.scene.items.updateItems([broken.id, ...carts.map((cart) => cart.id)], (items) => {
+      for (const item of items) {
+        if (item.id === broken.id) {
+          item.visible = true;
+          item.position.x = brokenFinal.x;
+          item.position.y = brokenFinal.y;
+          item.rotation = brokenFinal.rotation;
+          continue;
+        }
+        const final = finals.get(item.id);
+        if (!final) continue;
+        item.position.x = final.x;
+        item.position.y = final.y;
+        item.rotation = final.rotation;
+      }
+    });
+  } catch (error) {
+    try {
+      stop();
+    } catch {}
+    throw error;
+  }
+}
+
+async function runCrashWarningPopover(): Promise<void> {
+  const app = document.querySelector<HTMLDivElement>("#app")!;
+  app.innerHTML = `
+    <style>
+      html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+      #crashWarningButton {
+        width: 58px; height: 58px; margin: 3px; border-radius: 50%;
+        border: 2px solid rgba(255,214,102,0.9);
+        background: rgba(93,35,24,0.86); color: #ffd666;
+        font-size: 34px; line-height: 48px; cursor: pointer;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.4);
+        animation: minecartWarningPulse 1.25s ease-in-out infinite;
+      }
+      #crashWarningButton:hover { transform: scale(1.06); }
+      #crashWarningButton:disabled { cursor: default; opacity: 0.72; animation: none; }
+      #crashWarningButton.firing { animation: minecartWarningFastPulse 0.3s ease-in-out infinite; }
+      @keyframes minecartWarningPulse { 0%,100% { transform: scale(0.96); } 50% { transform: scale(1.04); } }
+      @keyframes minecartWarningFastPulse { 0%,100% { transform: scale(0.96); } 50% { transform: scale(1.09); } }
+    </style>
+    <button id="crashWarningButton" title="Send broken minecart">⚠</button>
+  `;
+  const button = document.querySelector<HTMLButtonElement>("#crashWarningButton")!;
+  if ((await OBR.player.getRole()) !== "GM") {
+    button.hidden = true;
+    return;
+  }
+
+  async function refresh(): Promise<void> {
+    const state = await readCrashRuntime();
+    button.disabled = state?.status !== "armed";
+  }
+
+  button.addEventListener("click", () => {
+    void (async () => {
+      const state = await readCrashRuntime();
+      if (!state || state.status !== "armed") return;
+
+      button.disabled = true;
+      button.classList.add("firing");
+      await writeCrashRuntime({ ...state, status: "running" });
+      await OBR.broadcast.sendMessage(
+        CRASH_CHANNEL,
+        { type: "release-rattle", chaseRevision: state.chaseRevision },
+        { destination: "LOCAL" },
+      );
+
+      try {
+        await waitMs(450);
+        await executeBrokenCartCrash({ ...state, status: "running" });
+        await writeCrashRuntime({ ...state, status: "complete" });
+        button.classList.remove("firing");
+        button.textContent = "💥";
+        await waitMs(700);
+        await OBR.popover.close(CRASH_POPOVER_ID);
+      } catch (error) {
+        console.error("Minecart Scroll crash event failed:", error);
+        await writeCrashRuntime({ ...state, status: "armed" });
+        button.classList.remove("firing");
+        button.textContent = "⚠";
+        button.disabled = false;
+      }
+    })();
+  });
+
+  OBR.scene.onMetadataChange(() => void refresh());
+  await refresh();
 }
 
 type SharedRenderEntry = {
@@ -480,7 +808,9 @@ async function runSharedInteractionRenderer(): Promise<void> {
   renderTick();
 }
 
-const backgroundMode = new URLSearchParams(window.location.search).get("background") === "1";
+const pageParams = new URLSearchParams(window.location.search);
+const backgroundMode = pageParams.get("background") === "1";
+const crashWarningMode = pageParams.get("crashWarning") === "1";
 
 type RunState = "stopped" | "running" | "paused";
 
@@ -510,12 +840,13 @@ type MinecartRattleGroup = {
   states: Map<string, MinecartRattleState>;
 };
 type SavedSettings = {
-  version: 3;
+  version: 4;
   floorIds: string[];
   trackIds: string[];
   backgroundIds: string[];
   foregroundIds: string[];
   minecartIds: string[];
+  brokenCartId: string | null;
   anchorX: number;
   anchorY: number;
   floorYOffset: number;
@@ -536,6 +867,8 @@ type SavedSettings = {
 };
 if (backgroundMode) {
   OBR.onReady(() => void runSharedInteractionRenderer());
+} else if (crashWarningMode) {
+  OBR.onReady(() => void runCrashWarningPopover());
 } else {
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div style="font-family: Arial, sans-serif; padding: 14px;">
@@ -562,7 +895,13 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="setForegroundButton">Set Foreground</button>
         <span id="foregroundStatus">Not set (optional)</span><br><br>
         <button id="setMinecartsButton">Set Minecarts</button>
-        <span id="minecartsStatus">Not set (optional)</span>
+        <span id="minecartsStatus">Not set (optional)</span><br><br>
+
+        <button id="setBrokenCartButton">Set Broken Cart</button>
+        <span id="brokenCartStatus">Not set (optional)</span>
+        <p style="font-size:12px; margin-bottom:0;">
+          Select one separate broken/wrecked cart. During a chase a GM-only ⚠ trigger hovers on the right side.
+        </p>
       </fieldset>
 
       <br>
@@ -692,11 +1031,13 @@ OBR.onReady(async () => {
   const backgroundStatus = document.querySelector<HTMLSpanElement>("#backgroundStatus")!;
   const foregroundStatus = document.querySelector<HTMLSpanElement>("#foregroundStatus")!;
   const minecartsStatus = document.querySelector<HTMLSpanElement>("#minecartsStatus")!;
+  const brokenCartStatus = document.querySelector<HTMLSpanElement>("#brokenCartStatus")!;
   const setFloorButton = document.querySelector<HTMLButtonElement>("#setFloorButton")!;
   const setTrackButton = document.querySelector<HTMLButtonElement>("#setTrackButton")!;
   const setBackgroundButton = document.querySelector<HTMLButtonElement>("#setBackgroundButton")!;
   const setForegroundButton = document.querySelector<HTMLButtonElement>("#setForegroundButton")!;
   const setMinecartsButton = document.querySelector<HTMLButtonElement>("#setMinecartsButton")!;
+  const setBrokenCartButton = document.querySelector<HTMLButtonElement>("#setBrokenCartButton")!;
   const saveButton = document.querySelector<HTMLButtonElement>("#saveButton")!;
   const loadButton = document.querySelector<HTMLButtonElement>("#loadButton")!;
   const anchorXInput = document.querySelector<HTMLInputElement>("#anchorXInput")!;
@@ -754,6 +1095,7 @@ OBR.onReady(async () => {
   let backgroundIds: string[] = [];
   let foregroundIds: string[] = [];
   let minecartIds: string[] = [];
+  let brokenCartId: string | null = null;
 
   let anchorX = 0;
   let anchorY = 0;
@@ -906,6 +1248,7 @@ OBR.onReady(async () => {
     backgroundStatus.textContent = backgroundIds.length >= 2 ? `${backgroundIds.length} images` : "Not set";
     foregroundStatus.textContent = foregroundIds.length >= 2 ? `${foregroundIds.length} images` : "Not set (optional)";
     minecartsStatus.textContent = minecartIds.length >= 1 ? `${minecartIds.length} images` : "Not set (optional)";
+    brokenCartStatus.textContent = brokenCartId ? "1 image" : "Not set (optional)";
   }
   function updateRunButtons(): void {
     startButton.disabled = runState !== "stopped" || renewing;
@@ -917,6 +1260,7 @@ OBR.onReady(async () => {
     setBackgroundButton.disabled = runState !== "stopped";
     setForegroundButton.disabled = runState !== "stopped";
     setMinecartsButton.disabled = runState !== "stopped";
+    setBrokenCartButton.disabled = runState !== "stopped";
     loadButton.disabled = runState !== "stopped";
   }
   function applyTargetSpeed(value: number): void {
@@ -989,6 +1333,19 @@ OBR.onReady(async () => {
       status.textContent = error instanceof Error ? error.message : "Could not change minecart rattle mode.";
     });
   });
+  OBR.broadcast.onMessage(CRASH_CHANNEL, (event) => {
+    const data = event.data as { type?: string };
+    if (data?.type !== "release-rattle") return;
+    void (async () => {
+      if (rattleEnabled) {
+        rattleEnabledCheckbox.checked = false;
+        await handleRattleToggle();
+      } else {
+        closeMinecartInteraction();
+      }
+      status.textContent = "Crash hazard triggered — minecart rattle released.";
+    })().catch((error) => console.error("Could not release minecart rattle for crash:", error));
+  });
   rattleStrengthSlider.addEventListener("input", () => {
     rattleStrengthValue.textContent = rattleStrengthSlider.value;
     readControls();
@@ -1026,7 +1383,7 @@ OBR.onReady(async () => {
     return images;
   }
 
-  type AssignableKind = "floor" | "track" | "background" | "foreground" | "minecarts";
+  type AssignableKind = "floor" | "track" | "background" | "foreground" | "minecarts" | "brokenCart";
   function overlapsOtherLayers(ids: string[], excluded: AssignableKind): boolean {
     const otherIds = [
       ...(excluded === "floor" ? [] : floorIds),
@@ -1034,6 +1391,7 @@ OBR.onReady(async () => {
       ...(excluded === "background" ? [] : backgroundIds),
       ...(excluded === "foreground" ? [] : foregroundIds),
       ...(excluded === "minecarts" ? [] : minecartIds),
+      ...(excluded === "brokenCart" || !brokenCartId ? [] : [brokenCartId]),
     ];
     const others = new Set(otherIds);
     return ids.some((id) => others.has(id));
@@ -1044,8 +1402,12 @@ OBR.onReady(async () => {
       return;
     }
 
-    const images = await getSelectedImages(kind === "minecarts" ? 1 : 2);
+    const images = await getSelectedImages(kind === "minecarts" || kind === "brokenCart" ? 1 : 2);
     if (!images) return;
+    if (kind === "brokenCart" && images.length !== 1) {
+      status.textContent = "Select exactly ONE image to use as the Broken Cart.";
+      return;
+    }
 
     const ids = images.map((image) => image.id);
     if (overlapsOtherLayers(ids, kind)) {
@@ -1057,6 +1419,7 @@ OBR.onReady(async () => {
     if (kind === "background") backgroundIds = ids;
     if (kind === "foreground") foregroundIds = ids;
     if (kind === "minecarts") minecartIds = ids;
+    if (kind === "brokenCart") brokenCartId = ids[0] ?? null;
 
     updateLayerLabels();
     await OBR.player.deselect();
@@ -1067,15 +1430,101 @@ OBR.onReady(async () => {
   setBackgroundButton.addEventListener("click", () => void setLayer("background"));
   setForegroundButton.addEventListener("click", () => void setLayer("foreground"));
   setMinecartsButton.addEventListener("click", () => void setLayer("minecarts"));
+  setBrokenCartButton.addEventListener("click", () => void setLayer("brokenCart"));
+
+  async function closeCrashWarningPopover(): Promise<void> {
+    try {
+      await OBR.popover.close(CRASH_POPOVER_ID);
+    } catch {}
+  }
+
+  async function openCrashWarningPopover(): Promise<void> {
+    if (!brokenCartId || minecartIds.length === 0 || runState !== "running") return;
+    const [width, height] = await Promise.all([OBR.viewport.getWidth(), OBR.viewport.getHeight()]);
+    await closeCrashWarningPopover();
+    await OBR.popover.open({
+      id: CRASH_POPOVER_ID,
+      url: `${window.location.pathname}?crashWarning=1&v=0.5.0`,
+      width: 64,
+      height: 64,
+      anchorReference: "POSITION",
+      anchorPosition: { left: Math.max(72, width - 10), top: Math.max(82, height * 0.5) },
+      anchorOrigin: { horizontal: "RIGHT", vertical: "CENTER" },
+      transformOrigin: { horizontal: "RIGHT", vertical: "CENTER" },
+      hidePaper: true,
+      disableClickAway: true,
+    });
+  }
+
+  async function armCrashHazard(): Promise<boolean> {
+    if (!brokenCartId || minecartIds.length === 0 || !runtimeState) {
+      await closeCrashWarningPopover();
+      return false;
+    }
+    const shared = await OBR.scene.items.getItems([brokenCartId, ...minecartIds]);
+    const byId = new Map(shared.filter(isImage).map((image) => [image.id, image] as const));
+    const broken = byId.get(brokenCartId);
+    const carts = minecartIds.map((id) => byId.get(id)).filter((image): image is Image => Boolean(image));
+    if (!broken || carts.length === 0) return false;
+
+    const state: CrashRuntimeState = {
+      version: 1,
+      chaseRevision: runtimeState.revision,
+      brokenCartId,
+      minecartIds: carts.map((cart) => cart.id),
+      status: "armed",
+      brokenHome: {
+        id: broken.id,
+        x: broken.position.x,
+        y: broken.position.y,
+        rotation: broken.rotation,
+        visible: broken.visible,
+      },
+      cartHomes: carts.map((cart) => ({
+        id: cart.id,
+        x: cart.position.x,
+        y: cart.position.y,
+        rotation: cart.rotation,
+        visible: cart.visible,
+      })),
+    };
+    await OBR.scene.items.updateItems([broken.id], (items) => {
+      for (const item of items) item.visible = false;
+    });
+    await writeCrashRuntime(state);
+    await openCrashWarningPopover();
+    return true;
+  }
+
+  async function restoreCrashHazard(restoreCarts: boolean): Promise<void> {
+    await closeCrashWarningPopover();
+    const crash = await readCrashRuntime();
+    if (!crash) return;
+    const homes = restoreCarts ? [crash.brokenHome, ...crash.cartHomes] : [crash.brokenHome];
+    await OBR.scene.items.updateItems(homes.map((home) => home.id), (items) => {
+      const homesById = new Map(homes.map((home) => [home.id, home] as const));
+      for (const item of items) {
+        const home = homesById.get(item.id);
+        if (!home) continue;
+        item.position.x = home.x;
+        item.position.y = home.y;
+        item.rotation = home.rotation;
+        item.visible = home.visible;
+      }
+    });
+    await writeCrashRuntime({ ...crash, status: "complete" });
+  }
+
   function makeSavedSettings(): SavedSettings {
     readControls();
     return {
-      version: 3,
+      version: 4,
       floorIds: [...floorIds],
       trackIds: [...trackIds],
       backgroundIds: [...backgroundIds],
       foregroundIds: [...foregroundIds],
       minecartIds: [...minecartIds],
+      brokenCartId,
       anchorX,
       anchorY,
       floorYOffset,
@@ -1099,12 +1548,13 @@ OBR.onReady(async () => {
     if (!raw || typeof raw !== "object") return null;
     const value = raw as Partial<SavedSettings>;
     return {
-      version: 3,
+      version: 4,
       floorIds: Array.isArray(value.floorIds) ? value.floorIds.filter((id): id is string => typeof id === "string") : [],
       trackIds: Array.isArray(value.trackIds) ? value.trackIds.filter((id): id is string => typeof id === "string") : [],
       backgroundIds: Array.isArray(value.backgroundIds) ? value.backgroundIds.filter((id): id is string => typeof id === "string") : [],
       foregroundIds: Array.isArray(value.foregroundIds) ? value.foregroundIds.filter((id): id is string => typeof id === "string") : [],
       minecartIds: Array.isArray(value.minecartIds) ? value.minecartIds.filter((id): id is string => typeof id === "string") : [],
+      brokenCartId: typeof value.brokenCartId === "string" ? value.brokenCartId : null,
       anchorX: Number.isFinite(value.anchorX) ? Number(value.anchorX) : 0,
       anchorY: Number.isFinite(value.anchorY) ? Number(value.anchorY) : 0,
       floorYOffset: clampNumber(Number(value.floorYOffset), -10000, 10000, 0),
@@ -1130,6 +1580,7 @@ OBR.onReady(async () => {
     backgroundIds = [...saved.backgroundIds];
     foregroundIds = [...saved.foregroundIds];
     minecartIds = [...saved.minecartIds];
+    brokenCartId = saved.brokenCartId;
     anchorXInput.value = String(saved.anchorX);
     anchorYInput.value = String(saved.anchorY);
     floorYOffsetInput.value = String(saved.floorYOffset);
@@ -2005,10 +2456,18 @@ OBR.onReady(async () => {
       lastMinecartRattleUpdateMs = 0;
       animationFrame = requestAnimationFrame(animate);
       updateRunButtons();
+      let crashArmed = false;
+      try {
+        crashArmed = await armCrashHazard();
+      } catch (error) {
+        console.error("Could not arm the broken-cart crash hazard:", error);
+        await closeCrashWarningPopover();
+      }
       const extras = [
         activeFloor ? "floor" : "",
         activeForeground ? "foreground" : "",
         activeMinecarts && rattleEnabled ? "minecart rattle" : "",
+        crashArmed ? "broken-cart hazard" : "",
       ].filter(Boolean);
       status.textContent =
         extras.length > 0
@@ -2055,6 +2514,7 @@ OBR.onReady(async () => {
     if (runState !== "running" || renewing || !runtimeState) return;
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
+    await closeCrashWarningPopover();
     const now = Date.now();
     const snapshot = motionAt(runtimeState.motion, now);
     runtimeState = {
@@ -2102,6 +2562,8 @@ OBR.onReady(async () => {
       lastMinecartRattleUpdateMs = 0;
       animationFrame = requestAnimationFrame(animate);
       updateRunButtons();
+      const crash = await readCrashRuntime();
+      if (crash?.status === "armed") await openCrashWarningPopover();
       status.textContent = "Resumed — local renderer accelerating back to target speed.";
     } catch (error) {
       status.textContent = error instanceof Error ? error.message : "Could not resume the chase.";
@@ -2111,6 +2573,9 @@ OBR.onReady(async () => {
     if (runState === "stopped" || renewing || !runtimeState) return;
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
+    await closeCrashWarningPopover();
+    const crashBeforeStop = await readCrashRuntime();
+    if (crashBeforeStop?.status === "armed") await restoreCrashHazard(false);
 
     const now = Date.now();
     const snapshot =
@@ -2150,6 +2615,7 @@ OBR.onReady(async () => {
   emergencyResetButton.addEventListener("click", async () => {
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
+    await restoreCrashHazard(true);
     closeLayerInteractions();
     closeMinecartInteraction();
     clearMinecartDropTimer();
@@ -2202,6 +2668,8 @@ OBR.onReady(async () => {
       activeMinecarts = prepareMinecarts(minecartImages);
       if (runState === "running") {
         if (activeMinecarts && rattleEnabled) await openMinecartInteraction();
+        const crash = await readCrashRuntime();
+        if (crash?.status === "armed") await openCrashWarningPopover();
         lastTime = performance.now();
         lastMinecartRattleUpdateMs = 0;
         animationFrame = requestAnimationFrame(animate);
