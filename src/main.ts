@@ -27,7 +27,6 @@ const SUBTLE_CAST_INTERACTION_COLOR = "#6B7280"; // muted charcoal
 const CRASH_STATE_KEY = "com.supercalfrag.minecart-scroll/crash-state-v2";
 const CRASH_CHANNEL = "com.supercalfrag.minecart-scroll/crash-control-v1";
 const CRASH_POPOVER_ID = "com.supercalfrag.minecart-scroll/crash-warning";
-const CRASH_APPROACH_MS = 1800;
 const CRASH_IMPACT_MS = 900;
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
@@ -336,11 +335,6 @@ function crashEaseOut(value: number): number {
   return 1 - Math.pow(1 - t, 3);
 }
 
-function crashEaseInOut(value: number): number {
-  const t = Math.max(0, Math.min(1, value));
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-}
-
 async function waitMs(ms: number): Promise<void> {
   await new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
@@ -398,6 +392,17 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
   const impactY = targetY;
   const baseBrokenRotation = broken.rotation;
 
+  const chaseRuntime = await readRuntimeState();
+  if (!chaseRuntime || chaseRuntime.runState !== "running") {
+    throw new Error("Start the chase before launching the Broken Cart.");
+  }
+  const chaseAtLaunch = motionAt(chaseRuntime.motion, Date.now());
+  if (chaseAtLaunch.speed <= 0.001 && chaseRuntime.motion.targetSpeed <= 0.001) {
+    throw new Error("The chase speed must be above zero before launching the Broken Cart.");
+  }
+  const approachDistance = Math.max(1, spawnPoint.x - impactX);
+  const chaseDistanceAtLaunch = chaseAtLaunch.distance;
+
   await OBR.scene.items.updateItems([broken.id], (items) => {
     for (const item of items) {
       item.visible = true;
@@ -413,13 +418,20 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
 
   try {
     await new Promise<void>((resolve) => {
-      const startedAt = performance.now();
-      const tick = (now: number) => {
-        const raw = Math.min(1, (now - startedAt) / CRASH_APPROACH_MS);
-        const eased = crashEaseInOut(raw);
-        const x = spawnPoint.x + (impactX - spawnPoint.x) * eased;
-        const wobble = Math.sin(raw * Math.PI * 10) * (2 + raw * 6);
-        const bounce = Math.sin(raw * Math.PI * 7) * (2 + raw * 4);
+      const tick = () => {
+        // Treat the Broken Cart as a wreck sitting farther down the tunnel.
+        // The party catches it at exactly the same rate the Track layer scrolls:
+        // every scene-unit of chase distance advances the wreck one scene-unit
+        // toward the player carts on screen.
+        const chaseNow = motionAt(chaseRuntime.motion, Date.now());
+        const travelled = Math.max(0, chaseNow.distance - chaseDistanceAtLaunch);
+        const raw = Math.min(1, travelled / approachDistance);
+        const x = Math.max(impactX, spawnPoint.x - travelled);
+
+        // Cosmetic damage wobble only; it does not change horizontal approach speed.
+        const wobble = Math.sin(travelled * 0.045) * (2 + raw * 6);
+        const bounce = Math.sin(travelled * 0.032) * (2 + raw * 4);
+
         update((draft) => {
           const items = Array.isArray(draft) ? draft : [draft];
           for (const item of items) {
@@ -429,6 +441,7 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
             item.rotation = baseBrokenRotation + wobble;
           }
         });
+
         if (raw >= 1) resolve();
         else requestAnimationFrame(tick);
       };
@@ -1562,7 +1575,7 @@ OBR.onReady(async () => {
     await closeCrashWarningPopover();
     await OBR.popover.open({
       id: CRASH_POPOVER_ID,
-      url: `${window.location.pathname}?crashWarning=1&v=0.5.2`,
+      url: `${window.location.pathname}?crashWarning=1&v=0.5.3`,
       width: 64,
       height: 64,
       anchorReference: "POSITION",
