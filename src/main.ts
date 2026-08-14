@@ -14,7 +14,7 @@ const LAYER_RENEW_FIRST_DELAY_MS: Record<string, number> = {
   Foreground: 25000,
 };
 const MINECART_DROP_SETTLE_MS = 250;
-const MINECART_RATTLE_TICK_MS = 60; // ~16.7 updates/sec: smoother network behavior while preserving visible vibration.
+const MINECART_RATTLE_TICK_MS = 33; // ~30 updates/sec for smooth visible motion while staying below every-frame writes.
 
 const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v41";
 const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v41";
@@ -579,12 +579,12 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <input id="accelerationSlider" type="range" min="0" max="100" value="0" step="0.5" style="width:100%;">
         <p id="speedScaleValue" style="font-size:12px; margin:6px 0 0;">Reading Owlbear grid scale...</p>
         <br><br>
-        <label>Floor Speed: <strong><span id="floorMultiplierValue">45</span>%</strong></label>
-        <input id="floorMultiplierSlider" type="range" min="0" max="100" value="45" step="5" style="width:100%;">
+        <label>Floor Speed: <strong><span id="floorMultiplierValue">10</span>%</strong></label>
+        <input id="floorMultiplierSlider" type="range" min="0" max="100" value="10" step="5" style="width:100%;">
 
         <br><br>
-        <label>Background Speed: <strong><span id="backgroundMultiplierValue">40</span>%</strong></label>
-        <input id="backgroundMultiplierSlider" type="range" min="0" max="100" value="40" step="5" style="width:100%;">
+        <label>Background Speed: <strong><span id="backgroundMultiplierValue">10</span>%</strong></label>
+        <input id="backgroundMultiplierSlider" type="range" min="0" max="100" value="10" step="5" style="width:100%;">
         <br><br>
         <label>Foreground Speed: <strong><span id="foregroundMultiplierValue">140</span>%</strong></label>
         <input id="foregroundMultiplierSlider" type="range" min="100" max="250" value="140" step="5" style="width:100%;">
@@ -598,8 +598,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           Enable minecart rattle (turn OFF for free movement)
         </label>
         <br><br>
-        <label>Rattle Strength: <strong><span id="rattleStrengthValue">100</span>%</strong></label>
-        <input id="rattleStrengthSlider" type="range" min="0" max="200" value="100" step="10" style="width:100%;">
+        <label>Rattle Strength: <strong><span id="rattleStrengthValue">30</span>%</strong></label>
+        <input id="rattleStrengthSlider" type="range" min="0" max="200" value="30" step="10" style="width:100%;">
         <br><br>
         <label>Rattle Starts At:
           <input id="rattleStartSpeedInput" type="number" min="0" max="100" value="0" step="0.5" style="width:80px;"> ft/s
@@ -714,11 +714,11 @@ OBR.onReady(async () => {
   let targetSpeed = 150;
   let currentSpeed = 0;
   let acceleration = 200;
-  let floorMultiplier = 0.45;
-  let backgroundMultiplier = 0.4;
+  let floorMultiplier = 0.1;
+  let backgroundMultiplier = 0.1;
   let foregroundMultiplier = 1.4;
   let rattleEnabled = true;
-  let rattleStrength = 1;
+  let rattleStrength = 0.3;
   let rattleStartSpeed = 100;
 
   // The scrolling engine continues to use Owlbear scene units/second internally.
@@ -845,7 +845,7 @@ OBR.onReady(async () => {
     backgroundOverlap = clampNumber(Number(backgroundOverlapInput.value), 0, 50, 0);
     foregroundOverlap = clampNumber(Number(foregroundOverlapInput.value), 0, 50, 0);
     rattleEnabled = rattleEnabledCheckbox.checked;
-    rattleStrength = clampNumber(Number(rattleStrengthSlider.value), 0, 200, 100) / 100;
+    rattleStrength = clampNumber(Number(rattleStrengthSlider.value), 0, 200, 30) / 100;
     rattleStartSpeed = clampNumber(feetPerSecondToInternalSpeed(Number(rattleStartSpeedInput.value)), 0, MAX_INTERNAL_SPEED, 100);
   }
   function updateLayerLabels(): void {
@@ -1063,11 +1063,11 @@ OBR.onReady(async () => {
       foregroundOverlap: clampNumber(Number(value.foregroundOverlap), 0, 50, 0),
       targetSpeed: clampNumber(Number(value.targetSpeed), 0, MAX_INTERNAL_SPEED, 150),
       acceleration: clampNumber(Number(value.acceleration), 25, MAX_INTERNAL_ACCELERATION, 200),
-      floorMultiplier: clampNumber(Number(value.floorMultiplier), 0, 1, 0.45),
-      backgroundMultiplier: clampNumber(Number(value.backgroundMultiplier), 0, 1, 0.4),
+      floorMultiplier: clampNumber(Number(value.floorMultiplier), 0, 1, 0.1),
+      backgroundMultiplier: clampNumber(Number(value.backgroundMultiplier), 0, 1, 0.1),
       foregroundMultiplier: clampNumber(Number(value.foregroundMultiplier), 1, 2.5, 1.4),
       rattleEnabled: typeof value.rattleEnabled === "boolean" ? value.rattleEnabled : true,
-      rattleStrength: clampNumber(Number(value.rattleStrength), 0, 2, 1),
+      rattleStrength: clampNumber(Number(value.rattleStrength), 0, 2, 0.3),
       rattleStartSpeed: clampNumber(Number(value.rattleStartSpeed), 0, MAX_INTERNAL_SPEED, 100),
       focusOnStart: typeof value.focusOnStart === "boolean" ? value.focusOnStart : true,
     };
@@ -1178,8 +1178,8 @@ OBR.onReady(async () => {
         baseY: image.position.y,
         phaseA: seededUnit(`${image.id}:phaseA`) * Math.PI * 2,
         phaseB: seededUnit(`${image.id}:phaseB`) * Math.PI * 2,
-        frequencyA: 3.5 + seededUnit(`${image.id}:freqA`) * 2.5,
-        frequencyB: 7 + seededUnit(`${image.id}:freqB`) * 4,
+        frequencyA: 1.35 + seededUnit(`${image.id}:freqA`) * 0.8,
+        frequencyB: 2.2 + seededUnit(`${image.id}:freqB`) * 0.9,
         amplitudeScale: 0.75 + seededUnit(`${image.id}:amp`) * 0.5,
         offsetY: 0,
       });
@@ -1792,11 +1792,11 @@ OBR.onReady(async () => {
     const raw = clampNumber((currentSpeed - rattleStartSpeed) / range, 0, 1, 0);
     const intensity = raw * raw * (3 - 2 * raw);
     const amplitude = 8 * intensity * rattleStrength;
-    const frequencyScale = 0.65 + raw * 1.6;
+    const frequencyScale = 0.8 + raw * 1.1;
     for (const cart of activeMinecarts.states.values()) {
       const waveA = Math.sin(timeSeconds * cart.frequencyA * frequencyScale * Math.PI * 2 + cart.phaseA);
       const waveB = Math.sin(timeSeconds * cart.frequencyB * frequencyScale * Math.PI * 2 + cart.phaseB);
-      cart.offsetY = amplitude * cart.amplitudeScale * (waveA * 0.65 + waveB * 0.35);
+      cart.offsetY = amplitude * cart.amplitudeScale * (waveA * 0.78 + waveB * 0.22);
     }
   }
 
