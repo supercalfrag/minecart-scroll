@@ -1,5 +1,4 @@
 import OBR, { isImage, type Image, type Metadata } from "@owlbear-rodeo/sdk";
-
 const SETTINGS_KEY = "com.supercalfrag.minecart-scroll/settings";
 const TRACK_OVERLAP = 2;
 const FLOOR_Z_GAP = 100000;
@@ -16,14 +15,12 @@ const LAYER_RENEW_FIRST_DELAY_MS: Record<string, number> = {
 };
 const MINECART_DROP_SETTLE_MS = 250;
 
-
 const RUNTIME_KEY = "com.supercalfrag.minecart-scroll/runtime-v41";
 const RENDERER_DIAG_KEY = "com.supercalfrag.minecart-scroll/renderer-diag-v41";
 const BACKGROUND_HEALTH_KEY = "com.supercalfrag.minecart-scroll/background-health-v41";
 const LOCAL_TICK_MS = 20; // 50fps target for the background shared-item interaction renderer.
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
-
 type RuntimeLayerSpec = {
   name: RuntimeLayerName;
   ids: string[];
@@ -32,6 +29,7 @@ type RuntimeLayerSpec = {
   spacing: number;
   baseZ: number;
   multiplier: number;
+  distanceOffset: number;
 };
 
 type MotionSegment = {
@@ -49,7 +47,6 @@ type RuntimeState = {
   layers: RuntimeLayerSpec[];
   motion: MotionSegment;
 };
-
 type RendererDiagnosticStage = "boot" | "runtime" | "items" | "moving" | "error";
 
 type RendererDiagnostic = {
@@ -68,14 +65,12 @@ type BackgroundHealth = {
   message: string;
 };
 
-
 function motionAt(segment: MotionSegment, nowMs = Date.now()): { distance: number; speed: number } {
   const elapsed = Math.max(0, (nowMs - segment.segmentStartMs) / 1000);
   const startSpeed = Math.max(0, segment.speedAtSegmentStart);
   const target = Math.max(0, segment.targetSpeed);
   const accel = Math.max(0.0001, segment.acceleration);
   const difference = target - startSpeed;
-
   if (Math.abs(difference) < 0.0001) {
     return {
       distance: segment.distanceAtSegmentStart + target * elapsed,
@@ -85,7 +80,6 @@ function motionAt(segment: MotionSegment, nowMs = Date.now()): { distance: numbe
 
   const direction = Math.sign(difference);
   const timeToTarget = Math.abs(difference) / accel;
-
   if (elapsed <= timeToTarget) {
     const speed = Math.max(0, startSpeed + direction * accel * elapsed);
     const travelled = startSpeed * elapsed + 0.5 * direction * accel * elapsed * elapsed;
@@ -101,7 +95,6 @@ function motionAt(segment: MotionSegment, nowMs = Date.now()): { distance: numbe
     speed: target,
   };
 }
-
 function positionForDistance(
   startX: number,
   spacing: number,
@@ -119,14 +112,12 @@ function positionForDistance(
   const wrapped = raw - cycles * total;
   return startX + wrapped;
 }
-
 function parseRuntime(raw: unknown): RuntimeState | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Partial<RuntimeState>;
   if (value.version !== 31 || typeof value.revision !== "number") return null;
   if (value.runState !== "running" && value.runState !== "paused" && value.runState !== "stopped") return null;
   if (!Array.isArray(value.layers) || !value.motion || typeof value.motion !== "object") return null;
-
   const layers: RuntimeLayerSpec[] = [];
   for (const rawLayer of value.layers) {
     if (!rawLayer || typeof rawLayer !== "object") continue;
@@ -146,9 +137,9 @@ function parseRuntime(raw: unknown): RuntimeState | null {
       spacing: Math.max(1, Number(layer.spacing) || 1),
       baseZ: Number(layer.baseZ) || 0,
       multiplier: Math.max(0, Number(layer.multiplier) || 0),
+      distanceOffset: Number.isFinite(Number(layer.distanceOffset)) ? Number(layer.distanceOffset) : 0,
     });
   }
-
   const motion = value.motion as Partial<MotionSegment>;
   return {
     version: 31,
@@ -164,7 +155,6 @@ function parseRuntime(raw: unknown): RuntimeState | null {
     },
   };
 }
-
 async function readRuntimeState(): Promise<RuntimeState | null> {
   if (!(await OBR.scene.isReady())) return null;
   const metadata = await OBR.scene.getMetadata();
@@ -174,7 +164,6 @@ async function readRuntimeState(): Promise<RuntimeState | null> {
 async function writeRuntimeState(runtime: RuntimeState): Promise<void> {
   await OBR.scene.setMetadata({ [RUNTIME_KEY]: runtime });
 }
-
 function parseRendererDiagnostic(raw: unknown): RendererDiagnostic | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Partial<RendererDiagnostic>;
@@ -189,12 +178,10 @@ function parseRendererDiagnostic(raw: unknown): RendererDiagnostic | null {
     message: typeof value.message === "string" ? value.message : "",
   };
 }
-
 async function readRendererDiagnostic(): Promise<RendererDiagnostic | null> {
   const metadata = await OBR.player.getMetadata();
   return parseRendererDiagnostic(metadata[RENDERER_DIAG_KEY]);
 }
-
 function parseBackgroundHealth(raw: unknown): BackgroundHealth | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Partial<BackgroundHealth>;
@@ -206,7 +193,6 @@ function parseBackgroundHealth(raw: unknown): BackgroundHealth | null {
     message: typeof value.message === "string" ? value.message : "",
   };
 }
-
 async function readBackgroundHealth(): Promise<BackgroundHealth | null> {
   const metadata = await OBR.player.getMetadata();
   return parseBackgroundHealth(metadata[BACKGROUND_HEALTH_KEY]);
@@ -222,7 +208,6 @@ type SharedInteractionManager = {
   update: (recipe: (draft: Image | Image[]) => void) => void;
   stop: () => void;
 };
-
 async function runSharedInteractionRenderer(): Promise<void> {
   let runtime: RuntimeState | null = null;
   let entries: SharedRenderEntry[] = [];
@@ -233,7 +218,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
   let lastRuntimePollSignature = "";
   let reportedMovingRevision = -1;
   let reportedErrorRevision = -1;
-
   async function reportDiagnostic(
     revision: number,
     stage: RendererDiagnosticStage,
@@ -250,7 +234,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
     };
     await OBR.player.setMetadata({ [RENDERER_DIAG_KEY]: diagnostic });
   }
-
   async function writeBackgroundHeartbeat(): Promise<void> {
     try {
       const health: BackgroundHealth = {
@@ -266,7 +249,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
       healthTimer = window.setTimeout(() => void writeBackgroundHeartbeat(), 1000);
     }
   }
-
   function stopInteraction(): void {
     if (manager) {
       try {
@@ -283,7 +265,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
     stopInteraction();
     try {
       await reportDiagnostic(next.revision, "runtime", "Background renderer received the chase state.", 0);
-
       const nextEntries: SharedRenderEntry[] = [];
       const interactionImages: Image[] = [];
       for (const spec of next.layers) {
@@ -296,9 +277,7 @@ async function runSharedInteractionRenderer(): Promise<void> {
           nextEntries.push({ image, spec, index });
         }
       }
-
       if (interactionImages.length === 0) throw new Error("No shared scenery items were available for the renderer.");
-
       const [update, stop] = await OBR.interaction.startItemInteraction(interactionImages);
       manager = {
         update: update as SharedInteractionManager["update"],
@@ -322,7 +301,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
       } catch {}
     }
   }
-
   function renderTick(): void {
     try {
       if (!runtime || runtime.runState === "stopped" || !manager || entries.length === 0) return;
@@ -331,7 +309,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
         runtime.runState === "running"
           ? motionAt(runtime.motion)
           : { distance: runtime.motion.distanceAtSegmentStart, speed: 0 };
-
       const xById = new Map<string, number>();
       const yById = new Map<string, number>();
       for (const entry of entries) {
@@ -342,12 +319,11 @@ async function runSharedInteractionRenderer(): Promise<void> {
             entry.spec.spacing,
             entry.spec.ids.length,
             entry.index,
-            snapshot.distance * entry.spec.multiplier,
+            snapshot.distance * entry.spec.multiplier + entry.spec.distanceOffset,
           ),
         );
         yById.set(entry.image.id, entry.spec.y);
       }
-
       manager.update((draft) => {
         const items = Array.isArray(draft) ? draft : [draft];
         for (const item of items) {
@@ -357,7 +333,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
           if (y !== undefined) item.position.y = y;
         }
       });
-
       if (runtime.runState === "running" && reportedMovingRevision !== runtime.revision) {
         reportedMovingRevision = runtime.revision;
         void reportDiagnostic(
@@ -378,7 +353,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
       timer = window.setTimeout(renderTick, LOCAL_TICK_MS);
     }
   }
-
   async function sync(metadata: Metadata): Promise<void> {
     const next = parseRuntime(metadata[RUNTIME_KEY]);
     const previous = runtime;
@@ -388,17 +362,21 @@ async function runSharedInteractionRenderer(): Promise<void> {
       stopInteraction();
       return;
     }
-
     const previousLayerSignature =
       previous?.layers
-        .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}:${layer.multiplier}`)
+        .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}`)
         .join("|") ?? "";
     const nextLayerSignature = next.layers
-      .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}:${layer.multiplier}`)
+      .map((layer) => `${layer.name}:${layer.ids.join(",")}:${layer.startX}:${layer.y}:${layer.spacing}`)
       .join("|");
-
     if (!manager || entries.length === 0 || previousLayerSignature !== nextLayerSignature) {
       await rebuild(next);
+    } else {
+      const nextSpecs = new Map(next.layers.map((layer) => [layer.name, layer] as const));
+      for (const entry of entries) {
+        const nextSpec = nextSpecs.get(entry.spec.name);
+        if (nextSpec) entry.spec = nextSpec;
+      }
     }
   }
 
@@ -408,7 +386,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
     } catch {}
     await sync(await OBR.scene.getMetadata());
   }
-
   async function pollRuntimeState(): Promise<void> {
     try {
       if (await OBR.scene.isReady()) {
@@ -426,7 +403,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
       runtimePollTimer = window.setTimeout(() => void pollRuntimeState(), 250);
     }
   }
-
   OBR.scene.onReadyChange((ready) => {
     void (async () => {
       if (!ready) {
@@ -441,7 +417,6 @@ async function runSharedInteractionRenderer(): Promise<void> {
       await sync(metadata);
     })();
   });
-
   void timer;
   void healthTimer;
   void runtimePollTimer;
@@ -464,7 +439,6 @@ type LoopLayer = {
   highestZ: number;
   zQueue: Promise<void>;
 };
-
 type MinecartRattleState = {
   baseX: number;
   baseY: number;
@@ -480,7 +454,6 @@ type MinecartRattleGroup = {
   images: Image[];
   states: Map<string, MinecartRattleState>;
 };
-
 type SavedSettings = {
   version: 3;
   floorIds: string[];
@@ -506,7 +479,6 @@ type SavedSettings = {
   rattleStartSpeed: number;
   focusOnStart: boolean;
 };
-
 if (backgroundMode) {
   OBR.onReady(() => void runSharedInteractionRenderer());
 } else {
@@ -515,7 +487,6 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <h2 style="margin: 0 0 8px; text-align: center;">Minecart Scroll</h2>
     <p id="status" style="text-align:center; margin: 6px 0 6px;">Waiting for Owlbear...</p>
     <p id="rendererHealth" style="text-align:center; margin:0 0 12px; font-size:12px; font-weight:bold;">Background renderer: checking...</p>
-
     <div id="playerPanel" hidden style="text-align:center; padding: 18px 8px;">
       <h3>Chase View</h3>
       <p>The GM controls Minecart Scroll.</p>
@@ -527,7 +498,6 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <legend><strong>Layers</strong></legend>
         <button id="setFloorButton">Set Floor</button>
         <span id="floorStatus">Not set (optional)</span><br><br>
-
         <button id="setBackgroundButton">Set Background</button>
         <span id="backgroundStatus">Not set</span><br><br>
 
@@ -536,7 +506,6 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 
         <button id="setForegroundButton">Set Foreground</button>
         <span id="foregroundStatus">Not set (optional)</span><br><br>
-
         <button id="setMinecartsButton">Set Minecarts</button>
         <span id="minecartsStatus">Not set (optional)</span>
       </fieldset>
@@ -551,9 +520,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           Saves layer assignments and chase controls to this Owlbear scene.
         </p>
       </fieldset>
-
       <br>
-
       <fieldset>
         <legend><strong>Anchor</strong></legend>
         <label>Anchor X:
@@ -570,9 +537,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           Go to anchor when chase starts
         </label>
       </fieldset>
-
       <br>
-
       <fieldset>
         <legend><strong>Layout</strong></legend>
         <label>Floor Y Offset:
@@ -599,7 +564,6 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <input id="foregroundOverlapInput" type="number" min="0" max="50" value="0" step="1" style="width:70px;">
         </label>
       </fieldset>
-
       <br>
 
       <fieldset>
@@ -608,11 +572,9 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <input id="targetSpeedSlider" type="range" min="0" max="100" value="0" step="0.5" style="width:100%;">
 
         <p style="margin:8px 0;">Current Speed: <strong><span id="currentSpeedValue">0.0</span> ft/s</strong></p>
-
         <label>Acceleration / Braking: <strong><span id="accelerationValue">—</span> ft/s²</strong></label>
         <input id="accelerationSlider" type="range" min="0" max="100" value="0" step="0.5" style="width:100%;">
         <p id="speedScaleValue" style="font-size:12px; margin:6px 0 0;">Reading Owlbear grid scale...</p>
-
         <br><br>
         <label>Floor Speed: <strong><span id="floorMultiplierValue">45</span>%</strong></label>
         <input id="floorMultiplierSlider" type="range" min="0" max="100" value="45" step="5" style="width:100%;">
@@ -620,14 +582,12 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <br><br>
         <label>Background Speed: <strong><span id="backgroundMultiplierValue">40</span>%</strong></label>
         <input id="backgroundMultiplierSlider" type="range" min="0" max="100" value="40" step="5" style="width:100%;">
-
         <br><br>
         <label>Foreground Speed: <strong><span id="foregroundMultiplierValue">140</span>%</strong></label>
         <input id="foregroundMultiplierSlider" type="range" min="100" max="250" value="140" step="5" style="width:100%;">
       </fieldset>
 
       <br>
-
       <fieldset>
         <legend><strong>Minecart Rattle</strong></legend>
         <label>
@@ -642,9 +602,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <input id="rattleStartSpeedInput" type="number" min="0" max="100" value="0" step="0.5" style="width:80px;"> ft/s
         </label>
       </fieldset>
-
       <br>
-
       <fieldset>
         <legend><strong>Chase</strong></legend>
         <button id="startButton">Start</button>
@@ -660,13 +618,11 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     </div>
   </div>
 `;
-
 OBR.onReady(async () => {
   const status = document.querySelector<HTMLParagraphElement>("#status")!;
   const rendererHealth = document.querySelector<HTMLParagraphElement>("#rendererHealth")!;
   const gmPanel = document.querySelector<HTMLDivElement>("#gmPanel")!;
   const playerPanel = document.querySelector<HTMLDivElement>("#playerPanel")!;
-
   const role = await OBR.player.getRole();
   if (role !== "GM") {
     playerPanel.hidden = false;
@@ -676,13 +632,11 @@ OBR.onReady(async () => {
 
   gmPanel.hidden = false;
   status.textContent = "GM controls ready.";
-
   const floorStatus = document.querySelector<HTMLSpanElement>("#floorStatus")!;
   const trackStatus = document.querySelector<HTMLSpanElement>("#trackStatus")!;
   const backgroundStatus = document.querySelector<HTMLSpanElement>("#backgroundStatus")!;
   const foregroundStatus = document.querySelector<HTMLSpanElement>("#foregroundStatus")!;
   const minecartsStatus = document.querySelector<HTMLSpanElement>("#minecartsStatus")!;
-
   const setFloorButton = document.querySelector<HTMLButtonElement>("#setFloorButton")!;
   const setTrackButton = document.querySelector<HTMLButtonElement>("#setTrackButton")!;
   const setBackgroundButton = document.querySelector<HTMLButtonElement>("#setBackgroundButton")!;
@@ -690,19 +644,16 @@ OBR.onReady(async () => {
   const setMinecartsButton = document.querySelector<HTMLButtonElement>("#setMinecartsButton")!;
   const saveButton = document.querySelector<HTMLButtonElement>("#saveButton")!;
   const loadButton = document.querySelector<HTMLButtonElement>("#loadButton")!;
-
   const anchorXInput = document.querySelector<HTMLInputElement>("#anchorXInput")!;
   const anchorYInput = document.querySelector<HTMLInputElement>("#anchorYInput")!;
   const goToAnchorButton = document.querySelector<HTMLButtonElement>("#goToAnchorButton")!;
   const focusOnStartCheckbox = document.querySelector<HTMLInputElement>("#focusOnStartCheckbox")!;
-
   const floorYOffsetInput = document.querySelector<HTMLInputElement>("#floorYOffsetInput")!;
   const trackYOffsetInput = document.querySelector<HTMLInputElement>("#trackYOffsetInput")!;
   const foregroundYOffsetInput = document.querySelector<HTMLInputElement>("#foregroundYOffsetInput")!;
   const floorOverlapInput = document.querySelector<HTMLInputElement>("#floorOverlapInput")!;
   const backgroundOverlapInput = document.querySelector<HTMLInputElement>("#backgroundOverlapInput")!;
   const foregroundOverlapInput = document.querySelector<HTMLInputElement>("#foregroundOverlapInput")!;
-
   const targetSpeedSlider = document.querySelector<HTMLInputElement>("#targetSpeedSlider")!;
   const targetSpeedValue = document.querySelector<HTMLSpanElement>("#targetSpeedValue")!;
   const currentSpeedValue = document.querySelector<HTMLSpanElement>("#currentSpeedValue")!;
@@ -719,9 +670,7 @@ OBR.onReady(async () => {
   const rattleStrengthSlider = document.querySelector<HTMLInputElement>("#rattleStrengthSlider")!;
   const rattleStrengthValue = document.querySelector<HTMLSpanElement>("#rattleStrengthValue")!;
   const rattleStartSpeedInput = document.querySelector<HTMLInputElement>("#rattleStartSpeedInput")!;
-
   const startButton = document.querySelector<HTMLButtonElement>("#startButton")!;
-
   async function refreshRendererHealth(): Promise<void> {
     try {
       const [health, diagnostic] = await Promise.all([readBackgroundHealth(), readRendererDiagnostic()]);
@@ -739,14 +688,12 @@ OBR.onReady(async () => {
       console.error("Could not read background renderer health:", error);
     }
   }
-
   window.setInterval(() => void refreshRendererHealth(), 500);
   void refreshRendererHealth();
   const pauseButton = document.querySelector<HTMLButtonElement>("#pauseButton")!;
   const resumeButton = document.querySelector<HTMLButtonElement>("#resumeButton")!;
   const stopButton = document.querySelector<HTMLButtonElement>("#stopButton")!;
   const emergencyResetButton = document.querySelector<HTMLButtonElement>("#emergencyResetButton")!;
-
   let floorIds: string[] = [];
   let trackIds: string[] = [];
   let backgroundIds: string[] = [];
@@ -761,7 +708,6 @@ OBR.onReady(async () => {
   let floorOverlap = 0;
   let backgroundOverlap = 0;
   let foregroundOverlap = 0;
-
   let targetSpeed = 150;
   let currentSpeed = 0;
   let acceleration = 200;
@@ -777,7 +723,6 @@ OBR.onReady(async () => {
   let sceneGridDpi = 150;
   let feetPerGridCell = 5;
   let speedScaleReady = false;
-
   let runState: RunState = "stopped";
   let runtimeState: RuntimeState | null = null;
   let activeFloor: LoopLayer | null = null;
@@ -785,14 +730,12 @@ OBR.onReady(async () => {
   let activeBackground: LoopLayer | null = null;
   let activeForeground: LoopLayer | null = null;
   let activeMinecarts: MinecartRattleGroup | null = null;
-
   type InteractionManager = Awaited<ReturnType<typeof OBR.interaction.startItemInteraction>>;
   const layerInteractions = new Map<string, InteractionManager>();
   const layerRenewTimers = new Map<string, number>();
   let minecartInteractionUpdate: InteractionManager[0] | null = null;
   let minecartInteractionStop: InteractionManager[1] | null = null;
   let minecartRenewTimer = 0;
-
   let selectedItemIds = new Set<string>();
   let draggedMinecartId: string | null = null;
   let minecartRattleSuspended = false;
@@ -808,7 +751,6 @@ OBR.onReady(async () => {
     if (!Number.isFinite(value)) return fallback;
     return Math.max(min, Math.min(max, value));
   }
-
   function gridUnitToFeet(unit: string): number | null {
     const normalized = unit.trim().toLowerCase();
     if (["ft", "foot", "feet"].includes(normalized)) return 1;
@@ -821,7 +763,6 @@ OBR.onReady(async () => {
     if (["km", "kilometer", "kilometers", "kilometre", "kilometres"].includes(normalized)) return 3280.839895;
     return null;
   }
-
   function internalSpeedToFeetPerSecond(value: number): number {
     if (!speedScaleReady || sceneGridDpi <= 0) return 0;
     return (value * feetPerGridCell) / sceneGridDpi;
@@ -835,7 +776,6 @@ OBR.onReady(async () => {
   function formatFeetPerSecondFromInternal(value: number): string {
     return internalSpeedToFeetPerSecond(value).toFixed(1);
   }
-
   function speedUiStep(maxFeetPerSecond: number): number {
     if (maxFeetPerSecond <= 10) return 0.1;
     if (maxFeetPerSecond <= 50) return 0.5;
@@ -848,7 +788,6 @@ OBR.onReady(async () => {
     const maxFeetPerSecond = internalSpeedToFeetPerSecond(1000);
     const minAccelerationFeetPerSecondSquared = internalSpeedToFeetPerSecond(25);
     const step = speedUiStep(maxFeetPerSecond);
-
     targetSpeedSlider.min = "0";
     targetSpeedSlider.max = String(maxFeetPerSecond);
     targetSpeedSlider.step = String(step);
@@ -861,10 +800,8 @@ OBR.onReady(async () => {
     rattleStartSpeedInput.max = String(maxFeetPerSecond);
     rattleStartSpeedInput.step = String(step);
   }
-
   function renderSpeedControls(): void {
     if (!speedScaleReady) return;
-
     configureSpeedControlRanges();
     targetSpeedSlider.value = String(internalSpeedToFeetPerSecond(targetSpeed));
     targetSpeedValue.textContent = formatFeetPerSecondFromInternal(targetSpeed);
@@ -873,7 +810,6 @@ OBR.onReady(async () => {
     accelerationValue.textContent = formatFeetPerSecondFromInternal(acceleration);
     rattleStartSpeedInput.value = String(internalSpeedToFeetPerSecond(rattleStartSpeed));
   }
-
   async function refreshSceneSpeedScale(): Promise<void> {
     if (!(await OBR.scene.isReady())) {
       speedScaleReady = false;
@@ -883,20 +819,17 @@ OBR.onReady(async () => {
 
     const [dpi, scale] = await Promise.all([OBR.scene.grid.getDpi(), OBR.scene.grid.getScale()]);
     const unitFeet = gridUnitToFeet(scale.parsed.unit);
-
     if (!Number.isFinite(dpi) || dpi <= 0 || !Number.isFinite(scale.parsed.multiplier) || scale.parsed.multiplier <= 0 || unitFeet === null) {
       speedScaleReady = false;
       speedScaleValue.textContent = `Cannot convert grid scale "${scale.raw}" to feet. Use a distance unit such as ft, in, yd, mi, m, cm, mm, or km.`;
       return;
     }
-
     sceneGridDpi = dpi;
     feetPerGridCell = scale.parsed.multiplier * unitFeet;
     speedScaleReady = true;
     speedScaleValue.textContent = `Scene scale: ${feetPerGridCell.toFixed(2).replace(/\.?0+$/, "")} ft/grid @ ${Math.round(sceneGridDpi)} units/grid`;
     renderSpeedControls();
   }
-
   function readControls(): void {
     anchorX = Number.isFinite(Number(anchorXInput.value)) ? Number(anchorXInput.value) : 0;
     anchorY = Number.isFinite(Number(anchorYInput.value)) ? Number(anchorYInput.value) : 0;
@@ -910,7 +843,6 @@ OBR.onReady(async () => {
     rattleStrength = clampNumber(Number(rattleStrengthSlider.value), 0, 200, 100) / 100;
     rattleStartSpeed = clampNumber(feetPerSecondToInternalSpeed(Number(rattleStartSpeedInput.value)), 0, 1000, 100);
   }
-
   function updateLayerLabels(): void {
     floorStatus.textContent = floorIds.length >= 2 ? `${floorIds.length} images` : "Not set (optional)";
     trackStatus.textContent = trackIds.length >= 2 ? `${trackIds.length} images` : "Not set";
@@ -918,7 +850,6 @@ OBR.onReady(async () => {
     foregroundStatus.textContent = foregroundIds.length >= 2 ? `${foregroundIds.length} images` : "Not set (optional)";
     minecartsStatus.textContent = minecartIds.length >= 1 ? `${minecartIds.length} images` : "Not set (optional)";
   }
-
   function updateRunButtons(): void {
     startButton.disabled = runState !== "stopped" || renewing;
     pauseButton.disabled = runState !== "running" || renewing;
@@ -931,7 +862,6 @@ OBR.onReady(async () => {
     setMinecartsButton.disabled = runState !== "stopped";
     loadButton.disabled = runState !== "stopped";
   }
-
   function applyTargetSpeed(value: number): void {
     targetSpeed = clampNumber(value, 0, 1000, 150);
     if (speedScaleReady) {
@@ -943,7 +873,6 @@ OBR.onReady(async () => {
   function applyTargetSpeedFeetPerSecond(value: number): void {
     applyTargetSpeed(feetPerSecondToInternalSpeed(value));
   }
-
   function applyAcceleration(value: number): void {
     acceleration = clampNumber(value, 25, 1000, 200);
     if (speedScaleReady) {
@@ -955,28 +884,24 @@ OBR.onReady(async () => {
   function applyAccelerationFeetPerSecondSquared(value: number): void {
     applyAcceleration(feetPerSecondToInternalSpeed(value));
   }
-
   function applyFloorMultiplier(percent: number): void {
     const value = clampNumber(percent, 0, 100, 45);
     floorMultiplier = value / 100;
     floorMultiplierSlider.value = String(value);
     floorMultiplierValue.textContent = String(Math.round(value));
   }
-
   function applyBackgroundMultiplier(percent: number): void {
     const value = clampNumber(percent, 0, 100, 40);
     backgroundMultiplier = value / 100;
     backgroundMultiplierSlider.value = String(value);
     backgroundMultiplierValue.textContent = String(Math.round(value));
   }
-
   function applyForegroundMultiplier(percent: number): void {
     const value = clampNumber(percent, 100, 250, 140);
     foregroundMultiplier = value / 100;
     foregroundMultiplierSlider.value = String(value);
     foregroundMultiplierValue.textContent = String(Math.round(value));
   }
-
   targetSpeedSlider.addEventListener("input", () => {
     applyTargetSpeedFeetPerSecond(Number(targetSpeedSlider.value));
     if (runState !== "stopped") void updateRuntimeMotionControls();
@@ -988,13 +913,25 @@ OBR.onReady(async () => {
   floorMultiplierSlider.addEventListener("input", () => applyFloorMultiplier(Number(floorMultiplierSlider.value)));
   backgroundMultiplierSlider.addEventListener("input", () => applyBackgroundMultiplier(Number(backgroundMultiplierSlider.value)));
   foregroundMultiplierSlider.addEventListener("input", () => applyForegroundMultiplier(Number(foregroundMultiplierSlider.value)));
+
+  floorMultiplierSlider.addEventListener("change", () => {
+    applyFloorMultiplier(Number(floorMultiplierSlider.value));
+    if (runState !== "stopped") void updateRuntimeLayerMultipliers();
+  });
+  backgroundMultiplierSlider.addEventListener("change", () => {
+    applyBackgroundMultiplier(Number(backgroundMultiplierSlider.value));
+    if (runState !== "stopped") void updateRuntimeLayerMultipliers();
+  });
+  foregroundMultiplierSlider.addEventListener("change", () => {
+    applyForegroundMultiplier(Number(foregroundMultiplierSlider.value));
+    if (runState !== "stopped") void updateRuntimeLayerMultipliers();
+  });
   rattleEnabledCheckbox.addEventListener("change", readControls);
   rattleStrengthSlider.addEventListener("input", () => {
     rattleStrengthValue.textContent = rattleStrengthSlider.value;
     readControls();
   });
   rattleStartSpeedInput.addEventListener("change", readControls);
-
   floorYOffsetInput.addEventListener("change", () => {
     const oldValue = floorYOffset;
     readControls();
@@ -1006,20 +943,17 @@ OBR.onReady(async () => {
     readControls();
     if (activeTrack) activeTrack.y += trackYOffset - oldValue;
   });
-
   foregroundYOffsetInput.addEventListener("change", () => {
     const oldValue = foregroundYOffset;
     readControls();
     if (activeForeground) activeForeground.y += foregroundYOffset - oldValue;
   });
-
   async function getSelectedImages(minimum: number): Promise<Image[] | null> {
     const selection = await OBR.player.getSelection();
     if (!selection || selection.length < minimum) {
       status.textContent = minimum === 1 ? "Select at least ONE image first." : "Select at least TWO images first.";
       return null;
     }
-
     const items = await OBR.scene.items.getItems(selection);
     const images = items.filter(isImage);
     if (images.length !== selection.length) {
@@ -1031,7 +965,6 @@ OBR.onReady(async () => {
   }
 
   type AssignableKind = "floor" | "track" | "background" | "foreground" | "minecarts";
-
   function overlapsOtherLayers(ids: string[], excluded: AssignableKind): boolean {
     const otherIds = [
       ...(excluded === "floor" ? [] : floorIds),
@@ -1043,7 +976,6 @@ OBR.onReady(async () => {
     const others = new Set(otherIds);
     return ids.some((id) => others.has(id));
   }
-
   async function setLayer(kind: AssignableKind): Promise<void> {
     if (runState !== "stopped") {
       status.textContent = "Stop the chase before changing layers.";
@@ -1058,7 +990,6 @@ OBR.onReady(async () => {
       status.textContent = "Floor, scenery layers, and minecarts must use different images.";
       return;
     }
-
     if (kind === "floor") floorIds = ids;
     if (kind === "track") trackIds = ids;
     if (kind === "background") backgroundIds = ids;
@@ -1069,13 +1000,11 @@ OBR.onReady(async () => {
     await OBR.player.deselect();
     status.textContent = `${kind[0].toUpperCase()}${kind.slice(1)} layer set.`;
   }
-
   setFloorButton.addEventListener("click", () => void setLayer("floor"));
   setTrackButton.addEventListener("click", () => void setLayer("track"));
   setBackgroundButton.addEventListener("click", () => void setLayer("background"));
   setForegroundButton.addEventListener("click", () => void setLayer("foreground"));
   setMinecartsButton.addEventListener("click", () => void setLayer("minecarts"));
-
   function makeSavedSettings(): SavedSettings {
     readControls();
     return {
@@ -1104,7 +1033,6 @@ OBR.onReady(async () => {
       focusOnStart: focusOnStartCheckbox.checked,
     };
   }
-
   function parseSavedSettings(raw: unknown): SavedSettings | null {
     if (!raw || typeof raw !== "object") return null;
     const value = raw as Partial<SavedSettings>;
@@ -1134,14 +1062,12 @@ OBR.onReady(async () => {
       focusOnStart: typeof value.focusOnStart === "boolean" ? value.focusOnStart : true,
     };
   }
-
   function applySavedSettings(saved: SavedSettings): void {
     floorIds = [...saved.floorIds];
     trackIds = [...saved.trackIds];
     backgroundIds = [...saved.backgroundIds];
     foregroundIds = [...saved.foregroundIds];
     minecartIds = [...saved.minecartIds];
-
     anchorXInput.value = String(saved.anchorX);
     anchorYInput.value = String(saved.anchorY);
     floorYOffsetInput.value = String(saved.floorYOffset);
@@ -1154,7 +1080,6 @@ OBR.onReady(async () => {
     rattleStrengthSlider.value = String(Math.round(saved.rattleStrength * 100));
     rattleStrengthValue.textContent = String(Math.round(saved.rattleStrength * 100));
     focusOnStartCheckbox.checked = saved.focusOnStart;
-
     applyTargetSpeed(saved.targetSpeed);
     applyAcceleration(saved.acceleration);
     rattleStartSpeed = saved.rattleStartSpeed;
@@ -1165,7 +1090,6 @@ OBR.onReady(async () => {
     readControls();
     updateLayerLabels();
   }
-
   async function saveSettings(): Promise<void> {
     if (!(await OBR.scene.isReady())) {
       status.textContent = "Open a scene before saving settings.";
@@ -1174,7 +1098,6 @@ OBR.onReady(async () => {
     await OBR.scene.setMetadata({ [SETTINGS_KEY]: makeSavedSettings() });
     status.textContent = "Settings saved to this scene.";
   }
-
   async function loadSettings(silent = false): Promise<boolean> {
     if (!(await OBR.scene.isReady())) {
       if (!silent) status.textContent = "Open a scene before loading settings.";
@@ -1190,10 +1113,8 @@ OBR.onReady(async () => {
     if (!silent) status.textContent = "Saved settings loaded.";
     return true;
   }
-
   saveButton.addEventListener("click", () => void saveSettings());
   loadButton.addEventListener("click", () => void loadSettings(false));
-
   async function goToAnchor(): Promise<void> {
     readControls();
     const screenPoint = await OBR.viewport.transformPoint({ x: anchorX, y: anchorY });
@@ -1201,7 +1122,6 @@ OBR.onReady(async () => {
     const viewportHeight = await OBR.viewport.getHeight();
     const currentPosition = await OBR.viewport.getPosition();
     const currentScale = await OBR.viewport.getScale();
-
     await OBR.viewport.animateTo({
       position: {
         x: currentPosition.x + viewportWidth / 2 - screenPoint.x,
@@ -1215,7 +1135,6 @@ OBR.onReady(async () => {
     await goToAnchor();
     status.textContent = `Focused on anchor ${anchorX}, ${anchorY}.`;
   });
-
   async function getLayerImages(ids: string[], name: string, required: boolean): Promise<Image[]> {
     if (ids.length === 0 && !required) return [];
     if (ids.length < 2) throw new Error(`${name} needs at least two assigned images.`);
@@ -1225,7 +1144,6 @@ OBR.onReady(async () => {
     if (images.length !== ids.length) throw new Error(`One or more ${name.toLowerCase()} images are missing.`);
     return images;
   }
-
   async function getMinecartImages(ids: string[]): Promise<Image[]> {
     if (ids.length === 0) return [];
     const items = await OBR.scene.items.getItems(ids);
@@ -1233,7 +1151,6 @@ OBR.onReady(async () => {
     if (images.length !== ids.length) throw new Error("One or more minecart images are missing.");
     return images;
   }
-
   function seededUnit(value: string): number {
     let hash = 2166136261;
     for (let index = 0; index < value.length; index += 1) {
@@ -1242,7 +1159,6 @@ OBR.onReady(async () => {
     }
     return (hash >>> 0) / 4294967295;
   }
-
   function prepareMinecarts(images: Image[]): MinecartRattleGroup | null {
     if (images.length === 0) return null;
     const states = new Map<string, MinecartRattleState>();
@@ -1260,7 +1176,6 @@ OBR.onReady(async () => {
     }
     return { images, states };
   }
-
   async function prepareLayer(
     name: string,
     images: Image[],
@@ -1272,21 +1187,18 @@ OBR.onReady(async () => {
     const first = images[0];
     const firstBounds = await OBR.scene.items.getItemBounds([first.id]);
     const displayedWidth = firstBounds.width;
-
     for (const image of images) {
       const bounds = await OBR.scene.items.getItemBounds([image.id]);
       if (Math.abs(bounds.width - displayedWidth) > 1) {
         throw new Error(`${name} images must have the same displayed width.`);
       }
     }
-
     const spacing = displayedWidth - overlap;
     const startX = overridePosition?.x ?? first.position.x;
     const startY = overridePosition?.y ?? first.position.y;
     const positions = new Map<string, number>();
     const order = new Map<string, number>();
     images.forEach((image, index) => order.set(image.id, index));
-
     await OBR.scene.items.updateItems(images, (items) => {
       for (const item of items) {
         const index = order.get(item.id);
@@ -1299,12 +1211,10 @@ OBR.onReady(async () => {
         positions.set(item.id, x);
       }
     });
-
     const refreshed = await OBR.scene.items.getItems(images.map((image) => image.id));
     const refreshedImages = refreshed.filter(isImage).sort((a, b) => a.position.x - b.position.x);
     positions.clear();
     refreshedImages.forEach((image, index) => positions.set(image.id, startX + index * spacing));
-
     return {
       name,
       images: refreshedImages,
@@ -1319,7 +1229,6 @@ OBR.onReady(async () => {
 
   function moveLayer(layer: LoopLayer, deltaTime: number, multiplier: number): void {
     const layerSpeed = currentSpeed * multiplier;
-
     for (const image of layer.images) {
       const oldX = layer.positions.get(image.id) ?? layer.startX;
       layer.positions.set(image.id, oldX - layerSpeed * deltaTime);
@@ -1331,7 +1240,6 @@ OBR.onReady(async () => {
       let leftImage: Image | null = null;
       let leftX = Infinity;
       let rightX = -Infinity;
-
       for (const image of layer.images) {
         const x = layer.positions.get(image.id) ?? 0;
         if (x < leftX) {
@@ -1346,7 +1254,6 @@ OBR.onReady(async () => {
         layer.highestZ += 1;
         const recycledImage = leftImage;
         const newZ = layer.highestZ;
-
         layer.zQueue = layer.zQueue
           .then(async () => {
             await OBR.scene.items.updateItems([recycledImage], (items) => {
@@ -1362,7 +1269,6 @@ OBR.onReady(async () => {
       }
     }
   }
-
   function getActiveLayers(): LoopLayer[] {
     return [activeFloor, activeBackground, activeTrack, activeForeground].filter((layer): layer is LoopLayer => layer !== null);
   }
@@ -1370,7 +1276,6 @@ OBR.onReady(async () => {
   function getActiveImages(): Image[] {
     return getActiveLayers().flatMap((layer) => layer.images);
   }
-
   function runtimeSpecForLayer(layer: LoopLayer, multiplier: number): RuntimeLayerSpec {
     return {
       name: layer.name as RuntimeLayerName,
@@ -1380,9 +1285,9 @@ OBR.onReady(async () => {
       spacing: layer.spacing,
       baseZ: Math.min(...layer.images.map((image) => image.zIndex)),
       multiplier,
+      distanceOffset: 0,
     };
   }
-
   function buildRuntimeState(revision: number, motion: MotionSegment, state: RunState): RuntimeState {
     const layers: RuntimeLayerSpec[] = [];
     if (activeFloor) layers.push(runtimeSpecForLayer(activeFloor, floorMultiplier));
@@ -1397,7 +1302,6 @@ OBR.onReady(async () => {
       motion,
     };
   }
-
   async function setSourceVisibility(visible: boolean): Promise<void> {
     const images = getActiveImages();
     if (images.length === 0) return;
@@ -1405,8 +1309,12 @@ OBR.onReady(async () => {
       for (const item of items) item.visible = visible;
     });
   }
-
-  async function commitRuntimeSources(runtime: RuntimeState, distance: number, visible: boolean): Promise<void> {
+  async function commitRuntimeSources(
+    runtime: RuntimeState,
+    distance: number,
+    visible: boolean,
+    includeDistanceOffset = true,
+  ): Promise<void> {
     for (const spec of runtime.layers) {
       const shared = await OBR.scene.items.getItems(spec.ids);
       const images = shared.filter(isImage);
@@ -1421,7 +1329,7 @@ OBR.onReady(async () => {
             spec.spacing,
             spec.ids.length,
             index,
-            distance * spec.multiplier,
+            distance * spec.multiplier + (includeDistanceOffset ? spec.distanceOffset : 0),
           ),
         );
       }
@@ -1441,7 +1349,6 @@ OBR.onReady(async () => {
       });
     }
   }
-
   async function updateRuntimeMotionControls(): Promise<void> {
     if (!runtimeState || runtimeState.runState === "stopped") return;
     const now = Date.now();
@@ -1463,6 +1370,46 @@ OBR.onReady(async () => {
     await writeRuntimeState(runtimeState);
   }
 
+  async function updateRuntimeLayerMultipliers(): Promise<void> {
+    if (!runtimeState || runtimeState.runState === "stopped") return;
+
+    const snapshot =
+      runtimeState.runState === "running"
+        ? motionAt(runtimeState.motion, Date.now())
+        : { distance: runtimeState.motion.distanceAtSegmentStart, speed: 0 };
+
+    const nextMultiplier: Record<RuntimeLayerName, number> = {
+      Floor: floorMultiplier,
+      Background: backgroundMultiplier,
+      Track: 1,
+      Foreground: foregroundMultiplier,
+    };
+
+    let changed = false;
+    const nextLayers = runtimeState.layers.map((layer) => {
+      const multiplier = nextMultiplier[layer.name];
+      if (Math.abs(multiplier - layer.multiplier) < 0.000001) return layer;
+
+      changed = true;
+      const currentLayerDistance =
+        snapshot.distance * layer.multiplier + layer.distanceOffset;
+
+      return {
+        ...layer,
+        multiplier,
+        distanceOffset: currentLayerDistance - snapshot.distance * multiplier,
+      };
+    });
+
+    if (!changed) return;
+
+    runtimeState = {
+      ...runtimeState,
+      revision: runtimeState.revision + 1,
+      layers: nextLayers,
+    };
+    await writeRuntimeState(runtimeState);
+  }
   function layerForItem(id: string): LoopLayer | null {
     for (const layer of getActiveLayers()) {
       if (layer.positions.has(id)) return layer;
@@ -1475,7 +1422,6 @@ OBR.onReady(async () => {
     if (layers.length === 0) return;
     await Promise.all(layers.map((layer) => layer.zQueue));
     const images = getActiveImages();
-
     await OBR.scene.items.updateItems(images, (items) => {
       for (const item of items) {
         const layer = layerForItem(item.id);
@@ -1489,7 +1435,6 @@ OBR.onReady(async () => {
       }
     });
   }
-
   async function resetMinecarts(): Promise<void> {
     if (!activeMinecarts) return;
     const images = activeMinecarts.images;
@@ -1504,7 +1449,6 @@ OBR.onReady(async () => {
       }
     });
   }
-
   function clearMinecartDropTimer(): void {
     if (minecartDropTimer) window.clearTimeout(minecartDropTimer);
     minecartDropTimer = 0;
@@ -1520,7 +1464,6 @@ OBR.onReady(async () => {
     const stop = minecartInteractionStop;
     minecartInteractionUpdate = null;
     minecartInteractionStop = null;
-
     if (stop) {
       try {
         stop();
@@ -1537,7 +1480,6 @@ OBR.onReady(async () => {
       .map((image) => image.id)
       .filter((id) => id !== draggedMinecartId);
     if (ids.length === 0) return null;
-
     const refreshed = await OBR.scene.items.getItems(ids);
     const refreshedImages = refreshed.filter(isImage);
     if (refreshedImages.length !== ids.length) throw new Error("One or more minecart images disappeared from the scene.");
@@ -1548,7 +1490,6 @@ OBR.onReady(async () => {
       image.position.x = cart.baseX;
       image.position.y = cart.baseY + cart.offsetY;
     }
-
     return OBR.interaction.startItemInteraction(refreshedImages);
   }
 
@@ -1557,7 +1498,6 @@ OBR.onReady(async () => {
     if (runState !== "running" || !minecartInteractionUpdate) return;
     minecartRenewTimer = window.setTimeout(() => void renewMinecartInteraction(), delayMs);
   }
-
   async function renewMinecartInteraction(): Promise<void> {
     if (runState !== "running" || !minecartInteractionStop) return;
     const oldStop = minecartInteractionStop;
@@ -1580,7 +1520,6 @@ OBR.onReady(async () => {
       if (runState === "running") scheduleMinecartRenewal(3000);
     }
   }
-
   async function openMinecartInteraction(): Promise<void> {
     closeMinecartInteraction();
     const interaction = await createMinecartInteraction();
@@ -1593,7 +1532,6 @@ OBR.onReady(async () => {
   async function captureDroppedMinecart(id: string): Promise<void> {
     clearMinecartDropTimer();
     if (!activeMinecarts || draggedMinecartId !== id) return;
-
     try {
       const items = await OBR.scene.items.getItems([id]);
       const item = items.find((candidate) => candidate.id === id);
@@ -1607,7 +1545,6 @@ OBR.onReady(async () => {
       lastObservedMinecartY = item.position.y;
       draggedMinecartId = null;
       minecartRattleSuspended = false;
-
       if (runState === "running" && !renewing) await openMinecartInteraction();
     } catch (error) {
       console.error("Could not capture dropped minecart:", error);
@@ -1622,10 +1559,8 @@ OBR.onReady(async () => {
   }
 
   selectedItemIds = new Set((await OBR.player.getSelection()) ?? []);
-
   OBR.player.onChange((player) => {
     const nextSelection = new Set<string>(player.selection ?? []);
-
     if (activeMinecarts && runState === "running") {
       for (const id of nextSelection) {
         if (!selectedItemIds.has(id) && activeMinecarts.states.has(id)) {
@@ -1636,7 +1571,6 @@ OBR.onReady(async () => {
           void openMinecartInteraction().catch((error) =>
             console.error("Could not keep other minecarts rattling:", error),
           );
-
           const cart = activeMinecarts.states.get(id)!;
           lastObservedMinecartX = cart.baseX;
           lastObservedMinecartY = cart.baseY;
@@ -1651,7 +1585,6 @@ OBR.onReady(async () => {
 
     selectedItemIds = nextSelection;
   });
-
   OBR.scene.items.onChange((items) => {
     if (!activeMinecarts || !minecartRattleSuspended || !draggedMinecartId) return;
 
@@ -1665,7 +1598,6 @@ OBR.onReady(async () => {
 
     const cart = activeMinecarts.states.get(draggedMinecartId);
     if (!cart) return;
-
     // The rattle interaction is fully stopped while dragging, so any movement
     // here belongs to Owlbear's normal pointer drag. Keep the newest resting
     // point and wait briefly for movement to stop before restarting rattle.
@@ -1676,7 +1608,6 @@ OBR.onReady(async () => {
     lastObservedMinecartY = item.position.y;
     scheduleMinecartDropCapture(draggedMinecartId);
   });
-
   function clearLayerRenewTimers(): void {
     for (const timer of layerRenewTimers.values()) window.clearTimeout(timer);
     layerRenewTimers.clear();
@@ -1693,13 +1624,11 @@ OBR.onReady(async () => {
     }
     layerInteractions.clear();
   }
-
   async function createLayerInteraction(layer: LoopLayer): Promise<InteractionManager> {
     const ids = layer.images.map((image) => image.id);
     const refreshed = await OBR.scene.items.getItems(ids);
     const refreshedImages = refreshed.filter(isImage);
     if (refreshedImages.length !== ids.length) throw new Error(`${layer.name} images disappeared from the scene.`);
-
     for (const image of refreshedImages) {
       const x = layer.positions.get(image.id);
       if (x !== undefined) image.position.x = x;
@@ -1713,7 +1642,6 @@ OBR.onReady(async () => {
     const existing = layerRenewTimers.get(layerName);
     if (existing !== undefined) window.clearTimeout(existing);
     if (runState !== "running") return;
-
     const timer = window.setTimeout(() => {
       layerRenewTimers.delete(layerName);
       void renewLayerInteraction(layerName);
@@ -1726,7 +1654,6 @@ OBR.onReady(async () => {
     const layer = getActiveLayers().find((candidate) => candidate.name === layerName);
     const old = layerInteractions.get(layerName);
     if (!layer || !old) return;
-
     let next: InteractionManager | null = null;
     try {
       // Renew the whole layer as one synchronized unit. Tiles within a layer
@@ -1737,7 +1664,6 @@ OBR.onReady(async () => {
         next[1]();
         return;
       }
-
       layerInteractions.set(layerName, next);
       try { old[1](); } catch (error) {
         console.error(`Could not retire previous ${layerName} interaction:`, error);
@@ -1749,7 +1675,6 @@ OBR.onReady(async () => {
       if (runState === "running") scheduleLayerRenewal(layerName, 3000);
     }
   }
-
   async function openLayerInteractions(): Promise<void> {
     closeLayerInteractions();
     for (const layer of getActiveLayers()) {
@@ -1761,7 +1686,6 @@ OBR.onReady(async () => {
       scheduleLayerRenewal(layer.name, LAYER_RENEW_FIRST_DELAY_MS[layer.name] ?? 22000);
     }
   }
-
   function cleanupInteractionForPageExit(): void {
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
@@ -1769,7 +1693,6 @@ OBR.onReady(async () => {
     closeMinecartInteraction();
     clearMinecartDropTimer();
   }
-
   async function handlePanelVisibility(): Promise<void> {
     if (document.visibilityState === "hidden") {
       if (animationFrame) cancelAnimationFrame(animationFrame);
@@ -1778,7 +1701,6 @@ OBR.onReady(async () => {
       await resetMinecarts();
       return;
     }
-
     if (runState === "running" && activeMinecarts) {
       try {
         await openMinecartInteraction();
@@ -1789,7 +1711,6 @@ OBR.onReady(async () => {
       }
     }
   }
-
   window.addEventListener("pagehide", cleanupInteractionForPageExit);
   window.addEventListener("beforeunload", cleanupInteractionForPageExit);
   document.addEventListener("visibilitychange", () => void handlePanelVisibility());
@@ -1799,20 +1720,17 @@ OBR.onReady(async () => {
     if (Math.abs(difference) <= maxDelta) return target;
     return current + Math.sign(difference) * maxDelta;
   }
-
   function updateMinecartRattle(timeSeconds: number): void {
     if (!activeMinecarts) return;
     if (!rattleEnabled || currentSpeed <= rattleStartSpeed || rattleStrength <= 0) {
       for (const cart of activeMinecarts.states.values()) cart.offsetY = 0;
       return;
     }
-
     const range = Math.max(1, 1000 - rattleStartSpeed);
     const raw = clampNumber((currentSpeed - rattleStartSpeed) / range, 0, 1, 0);
     const intensity = raw * raw * (3 - 2 * raw);
     const amplitude = 8 * intensity * rattleStrength;
     const frequencyScale = 0.65 + raw * 1.6;
-
     for (const cart of activeMinecarts.states.values()) {
       const waveA = Math.sin(timeSeconds * cart.frequencyA * frequencyScale * Math.PI * 2 + cart.phaseA);
       const waveB = Math.sin(timeSeconds * cart.frequencyB * frequencyScale * Math.PI * 2 + cart.phaseB);
@@ -1822,14 +1740,12 @@ OBR.onReady(async () => {
 
   function animate(time: number): void {
     if (runState !== "running") return;
-
     const snapshot = runtimeState
       ? motionAt(runtimeState.motion)
       : { distance: 0, speed: 0 };
     currentSpeed = snapshot.speed;
     currentSpeedValue.textContent = speedScaleReady ? formatFeetPerSecondFromInternal(currentSpeed) : "0.0";
     updateMinecartRattle(time / 1000);
-
     if (minecartInteractionUpdate && activeMinecarts) {
       minecartInteractionUpdate((draft) => {
         const items = Array.isArray(draft) ? draft : [draft];
@@ -1842,7 +1758,6 @@ OBR.onReady(async () => {
         }
       });
     }
-
     animationFrame = requestAnimationFrame(animate);
   }
 
@@ -1853,10 +1768,8 @@ OBR.onReady(async () => {
     const backgroundImages = await getLayerImages(backgroundIds, "Background", true);
     const foregroundImages = await getLayerImages(foregroundIds, "Foreground", false);
     const minecartImages = await getMinecartImages(minecartIds);
-
     const combined = [...floorImages, ...trackImages, ...backgroundImages, ...foregroundImages];
     const baseZ = Math.min(...combined.map((image) => image.zIndex));
-
     const sortedBackground = [...backgroundImages].sort((a, b) => a.position.x - b.position.x);
     const firstBackground = sortedBackground[0];
     const backgroundBounds = await OBR.scene.items.getItemBounds([firstBackground.id]);
@@ -1864,11 +1777,9 @@ OBR.onReady(async () => {
       x: firstBackground.position.x + (anchorX - backgroundBounds.center.x),
       y: firstBackground.position.y + (anchorY - backgroundBounds.center.y),
     };
-
     activeBackground = await prepareLayer("Background", backgroundImages, baseZ, backgroundOverlap, backgroundOverride);
 
     const currentBackgroundBounds = await OBR.scene.items.getItemBounds([activeBackground.images[0].id]);
-
     activeFloor = null;
     if (floorImages.length >= 2) {
       const sortedFloor = [...floorImages].sort((a, b) => a.position.x - b.position.x);
@@ -1880,7 +1791,6 @@ OBR.onReady(async () => {
       };
       activeFloor = await prepareLayer("Floor", floorImages, baseZ - FLOOR_Z_GAP, floorOverlap, floorOverride);
     }
-
     const sortedTrack = [...trackImages].sort((a, b) => a.position.x - b.position.x);
     const firstTrack = sortedTrack[0];
     const trackBounds = await OBR.scene.items.getItemBounds([firstTrack.id]);
@@ -1888,9 +1798,7 @@ OBR.onReady(async () => {
       x: firstTrack.position.x + (currentBackgroundBounds.center.x - trackBounds.center.x),
       y: firstTrack.position.y + (currentBackgroundBounds.center.y - trackBounds.center.y) + trackYOffset,
     };
-
     activeTrack = await prepareLayer("Track", trackImages, baseZ + TRACK_Z_GAP, TRACK_OVERLAP, trackOverride);
-
     activeForeground = null;
     if (foregroundImages.length >= 2) {
       const sortedForeground = [...foregroundImages].sort((a, b) => a.position.x - b.position.x);
@@ -1900,7 +1808,6 @@ OBR.onReady(async () => {
         x: firstForeground.position.x + (currentBackgroundBounds.center.x - foregroundBounds.center.x),
         y: firstForeground.position.y + (currentBackgroundBounds.center.y - foregroundBounds.center.y) + foregroundYOffset,
       };
-
       activeForeground = await prepareLayer(
         "Foreground",
         foregroundImages,
@@ -1919,7 +1826,6 @@ OBR.onReady(async () => {
       status.textContent = "Open a scene first.";
       return;
     }
-
     const rendererHealthState = await readBackgroundHealth();
     if (!rendererHealthState || Date.now() - rendererHealthState.atMs >= 2500) {
       status.textContent = "Background renderer is OFFLINE. The hidden background page is not running, so Start was cancelled safely.";
@@ -1931,7 +1837,6 @@ OBR.onReady(async () => {
       await prepareChase();
       await OBR.player.deselect();
       if (focusOnStartCheckbox.checked) await goToAnchor();
-
       const previous = await readRuntimeState();
       const now = Date.now();
       runtimeState = buildRuntimeState(
@@ -1945,12 +1850,10 @@ OBR.onReady(async () => {
         },
         "running",
       );
-
       // Publish the chase clock first while the shared scenery remains visible.
       // The background renderer must explicitly report a successful moving frame
       // before we hide the originals. This makes startup failure non-destructive.
       await writeRuntimeState(runtimeState);
-
       const expectedRevision = runtimeState.revision;
       const deadline = Date.now() + 3500;
       let diagnostic: RendererDiagnostic | null = null;
@@ -1965,7 +1868,6 @@ OBR.onReady(async () => {
         }
         await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
       }
-
       if (diagnostic?.revision !== expectedRevision || diagnostic.stage !== "moving") {
         const stage = diagnostic?.revision === expectedRevision ? diagnostic.stage : "no response";
         throw new Error(
@@ -1974,7 +1876,6 @@ OBR.onReady(async () => {
       }
 
       // The renderer is interacting with the real shared scene items, so they remain visible.
-
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
       runState = "running";
@@ -2028,12 +1929,10 @@ OBR.onReady(async () => {
       updateRunButtons();
     }
   });
-
   pauseButton.addEventListener("click", async () => {
     if (runState !== "running" || renewing || !runtimeState) return;
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
-
     const now = Date.now();
     const snapshot = motionAt(runtimeState.motion, now);
     runtimeState = {
@@ -2048,7 +1947,6 @@ OBR.onReady(async () => {
       },
     };
     await writeRuntimeState(runtimeState);
-
     closeMinecartInteraction();
     await resetMinecarts();
     currentSpeed = 0;
@@ -2057,7 +1955,6 @@ OBR.onReady(async () => {
     updateRunButtons();
     status.textContent = "Paused — local scenery positions preserved.";
   });
-
   resumeButton.addEventListener("click", async () => {
     if (runState !== "paused" || renewing || !runtimeState) return;
     try {
@@ -2075,7 +1972,6 @@ OBR.onReady(async () => {
         },
       };
       await writeRuntimeState(runtimeState);
-
       currentSpeed = 0;
       currentSpeedValue.textContent = "0.0";
       runState = "running";
@@ -2088,7 +1984,6 @@ OBR.onReady(async () => {
       status.textContent = error instanceof Error ? error.message : "Could not resume the chase.";
     }
   });
-
   stopButton.addEventListener("click", async () => {
     if (runState === "stopped" || renewing || !runtimeState) return;
     if (animationFrame) cancelAnimationFrame(animationFrame);
@@ -2099,13 +1994,11 @@ OBR.onReady(async () => {
       runtimeState.runState === "running"
         ? motionAt(runtimeState.motion, now)
         : { distance: runtimeState.motion.distanceAtSegmentStart, speed: 0 };
-
     closeMinecartInteraction();
     clearMinecartDropTimer();
     draggedMinecartId = null;
     minecartRattleSuspended = false;
     await resetMinecarts();
-
     // Restore the shared scenery exactly where the local renderer finished.
     await commitRuntimeSources(runtimeState, snapshot.distance, true);
     runtimeState = {
@@ -2120,7 +2013,6 @@ OBR.onReady(async () => {
       },
     };
     await writeRuntimeState(runtimeState);
-
     currentSpeed = 0;
     currentSpeedValue.textContent = "0.0";
     activeFloor = null;
@@ -2132,7 +2024,6 @@ OBR.onReady(async () => {
     updateRunButtons();
     status.textContent = "Stopped. Shared scenery restored at the final chase position.";
   });
-
   emergencyResetButton.addEventListener("click", async () => {
     if (animationFrame) cancelAnimationFrame(animationFrame);
     animationFrame = 0;
@@ -2142,10 +2033,9 @@ OBR.onReady(async () => {
     draggedMinecartId = null;
     minecartRattleSuspended = false;
     await resetMinecarts();
-
     const runtime = runtimeState ?? (await readRuntimeState());
     if (runtime) {
-      await commitRuntimeSources(runtime, 0, true);
+      await commitRuntimeSources(runtime, 0, true, false);
       runtimeState = {
         ...runtime,
         revision: runtime.revision + 1,
@@ -2163,7 +2053,6 @@ OBR.onReady(async () => {
         await setSourceVisibility(true);
       } catch {}
     }
-
     renewing = false;
     currentSpeed = 0;
     currentSpeedValue.textContent = "0.0";
@@ -2176,14 +2065,12 @@ OBR.onReady(async () => {
     updateRunButtons();
     status.textContent = "Emergency reset complete. Shared scenery restored to chase start.";
   });
-
   updateLayerLabels();
   updateRunButtons();
   await refreshSceneSpeedScale();
   OBR.scene.grid.onChange(() => void refreshSceneSpeedScale());
   await loadSettings(true);
   renderSpeedControls();
-
   runtimeState = await readRuntimeState();
   if (runtimeState && runtimeState.runState !== "stopped") {
     runState = runtimeState.runState;
@@ -2199,7 +2086,6 @@ OBR.onReady(async () => {
       console.error("Could not restore minecart rattle state:", error);
     }
   }
-
   OBR.scene.onMetadataChange((metadata) => {
     const next = parseRuntime(metadata[RUNTIME_KEY]);
     if (!next) return;
@@ -2207,7 +2093,6 @@ OBR.onReady(async () => {
     runState = next.runState;
     updateRunButtons();
   });
-
   // These legacy helpers are intentionally retained for the frozen 0.2.x rollback
   // path, but v0.3.x scenery rendering no longer calls them directly. Keep an
   // explicit reference so projects with TypeScript noUnusedLocals enabled compile.
