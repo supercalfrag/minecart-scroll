@@ -27,7 +27,7 @@ const SUBTLE_CAST_INTERACTION_COLOR = "#6B7280"; // muted charcoal
 const CRASH_STATE_KEY = "com.supercalfrag.minecart-scroll/crash-state-v2";
 const CRASH_CHANNEL = "com.supercalfrag.minecart-scroll/crash-control-v1";
 const CRASH_POPOVER_ID = "com.supercalfrag.minecart-scroll/crash-warning";
-const CRASH_IMPACT_MS = 900;
+const CRASH_FALL_MS = 4300; // cinematic hundreds-of-feet freefall.
 
 type RuntimeLayerName = "Floor" | "Background" | "Track" | "Foreground";
 type RuntimeLayerSpec = {
@@ -214,6 +214,8 @@ type CrashHome = {
   y: number;
   rotation: number;
   visible: boolean;
+  scaleX: number;
+  scaleY: number;
 };
 
 type CrashRuntimeState = {
@@ -280,6 +282,8 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
         y: Number(home.y),
         rotation: Number(home.rotation),
         visible: home.visible,
+        scaleX: Number.isFinite(home.scaleX) ? Number(home.scaleX) : 1,
+        scaleY: Number.isFinite(home.scaleY) ? Number(home.scaleY) : 1,
       });
     }
     return homes;
@@ -304,6 +308,8 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
       y: Number(broken.y),
       rotation: Number(broken.rotation),
       visible: broken.visible,
+      scaleX: Number.isFinite(broken.scaleX) ? Number(broken.scaleX) : 1,
+      scaleY: Number.isFinite(broken.scaleY) ? Number(broken.scaleY) : 1,
     },
     cartHomes,
     crashedHomes,
@@ -373,14 +379,17 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
     y: targetY,
     rotation: cart.rotation,
     visible: cart.visible,
+    scaleX: cart.scale.x,
+    scaleY: cart.scale.y,
   }));
 
   const sortedCarts = [...carts].sort((a, b) => b.position.x - a.position.x);
   const frontCart = sortedCarts[0];
-  const [frontBounds, brokenBounds, viewportWidth] = await Promise.all([
+  const [frontBounds, brokenBounds, viewportWidth, viewportHeight] = await Promise.all([
     OBR.scene.items.getItemBounds([frontCart.id]),
     OBR.scene.items.getItemBounds([broken.id]),
     OBR.viewport.getWidth(),
+    OBR.viewport.getHeight(),
   ]);
   const frontScreen = await OBR.viewport.transformPoint({ x: frontCart.position.x, y: targetY });
   const spawnPoint = await OBR.viewport.inverseTransformPoint({
@@ -428,17 +437,13 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
         const raw = Math.min(1, travelled / approachDistance);
         const x = Math.max(impactX, spawnPoint.x - travelled);
 
-        // Cosmetic damage wobble only; it does not change horizontal approach speed.
-        const wobble = Math.sin(travelled * 0.045) * (2 + raw * 6);
-        const bounce = Math.sin(travelled * 0.032) * (2 + raw * 4);
-
         update((draft) => {
           const items = Array.isArray(draft) ? draft : [draft];
           for (const item of items) {
             if (item.id !== broken.id) continue;
             item.position.x = x;
-            item.position.y = impactY + bounce;
-            item.rotation = baseBrokenRotation + wobble;
+            item.position.y = impactY;
+            item.rotation = baseBrokenRotation;
           }
         });
 
@@ -448,49 +453,110 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
       requestAnimationFrame(tick);
     });
 
-    const starts = new Map(
-      carts.map((cart) => [cart.id, { x: cart.position.x, y: cart.position.y, rotation: cart.rotation }] as const),
+    type FallProfile = {
+      id: string;
+      startX: number;
+      startY: number;
+      startRotation: number;
+      startScaleX: number;
+      startScaleY: number;
+      direction: 1 | -1;
+      sideKick: number;
+      horizontalDrift: number;
+      fallDistance: number;
+      spinDegrees: number;
+      endScaleFactor: number;
+    };
+
+    const centerScreen = await OBR.viewport.transformPoint({ x: frontCart.position.x, y: targetY });
+    const lowerWorld = await OBR.viewport.inverseTransformPoint({
+      x: centerScreen.x,
+      y: Math.min(viewportHeight + 200, centerScreen.y + viewportHeight * 0.92),
+    });
+    const upperWorld = await OBR.viewport.inverseTransformPoint({
+      x: centerScreen.x,
+      y: Math.max(-200, centerScreen.y - viewportHeight * 0.92),
+    });
+    const screenFallDistance = Math.max(
+      300,
+      Math.abs(lowerWorld.y - targetY),
+      Math.abs(upperWorld.y - targetY),
     );
-    const finals = new Map<string, { x: number; y: number; rotation: number }>();
+
+    const profiles = new Map<string, FallProfile>();
+
     sortedCarts.forEach((cart, index) => {
       const seed = crashSeed(cart.id);
-      const direction = index % 2 === 0 ? 1 : -1;
-      const start = starts.get(cart.id)!;
-      finals.set(cart.id, {
-        x: start.x - (45 + seed * 35 + index * 18),
-        y: start.y + direction * (95 + seed * 75 + Math.max(0, 2 - index) * 18),
-        rotation: start.rotation + direction * (22 + seed * 34),
+      const direction: 1 | -1 = index % 2 === 0 ? 1 : -1;
+      const frontBias = Math.max(0, 2 - index);
+      profiles.set(cart.id, {
+        id: cart.id,
+        startX: cart.position.x,
+        startY: cart.position.y,
+        startRotation: cart.rotation,
+        startScaleX: cart.scale.x,
+        startScaleY: cart.scale.y,
+        direction,
+        sideKick: 55 + seed * 85 + frontBias * 28,
+        horizontalDrift: -(70 + seed * 90 + index * 22),
+        fallDistance: screenFallDistance * (0.82 + seed * 0.42),
+        spinDegrees: direction * (720 + seed * 1080 + frontBias * 180),
+        endScaleFactor: 0.18 + seed * 0.09,
       });
     });
 
-    const brokenFinal = {
-      x: impactX - Math.max(55, brokenBounds.width * 0.35),
-      y: impactY - Math.max(70, brokenBounds.height * 0.45),
-      rotation: baseBrokenRotation - 48,
-    };
+    const brokenSeed = crashSeed(broken.id);
+    const brokenDirection: 1 | -1 = sortedCarts.length % 2 === 0 ? -1 : 1;
+    profiles.set(broken.id, {
+      id: broken.id,
+      startX: impactX,
+      startY: impactY,
+      startRotation: baseBrokenRotation,
+      startScaleX: broken.scale.x,
+      startScaleY: broken.scale.y,
+      direction: brokenDirection,
+      sideKick: 80 + brokenSeed * 90,
+      horizontalDrift: -(110 + brokenSeed * 120),
+      fallDistance: screenFallDistance * (0.9 + brokenSeed * 0.35),
+      spinDegrees: brokenDirection * (900 + brokenSeed * 1260),
+      endScaleFactor: 0.17 + brokenSeed * 0.08,
+    });
 
     await new Promise<void>((resolve) => {
       const startedAt = performance.now();
       const tick = (now: number) => {
-        const raw = Math.min(1, (now - startedAt) / CRASH_IMPACT_MS);
-        const eased = crashEaseOut(raw);
+        const elapsedMs = now - startedAt;
+        const raw = Math.min(1, elapsedMs / CRASH_FALL_MS);
+        const kickProgress = Math.min(1, elapsedMs / 320);
+        const kickEase = crashEaseOut(kickProgress);
+        const gravityProgress = raw * raw;
+        const driftProgress = raw;
+        const depthProgress = Math.pow(raw, 1.15);
+
         update((draft) => {
           const items = Array.isArray(draft) ? draft : [draft];
           for (const item of items) {
-            if (item.id === broken.id) {
-              item.position.x = impactX + (brokenFinal.x - impactX) * eased;
-              item.position.y = impactY + (brokenFinal.y - impactY) * eased;
-              item.rotation = baseBrokenRotation + (brokenFinal.rotation - baseBrokenRotation) * eased;
-              continue;
-            }
-            const start = starts.get(item.id);
-            const final = finals.get(item.id);
-            if (!start || !final) continue;
-            item.position.x = start.x + (final.x - start.x) * eased;
-            item.position.y = start.y + (final.y - start.y) * eased;
-            item.rotation = start.rotation + (final.rotation - start.rotation) * eased;
+            const profile = profiles.get(item.id);
+            if (!profile) continue;
+
+            item.position.x =
+              profile.startX + profile.horizontalDrift * driftProgress;
+            item.position.y =
+              profile.startY +
+              profile.direction * (
+                profile.sideKick * kickEase +
+                profile.fallDistance * gravityProgress
+              );
+            item.rotation =
+              profile.startRotation + profile.spinDegrees * raw;
+
+            const scaleFactor =
+              1 - (1 - profile.endScaleFactor) * depthProgress;
+            item.scale.x = profile.startScaleX * scaleFactor;
+            item.scale.y = profile.startScaleY * scaleFactor;
           }
         });
+
         if (raw >= 1) resolve();
         else requestAnimationFrame(tick);
       };
@@ -498,20 +564,19 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashEx
     });
 
     stop();
+
     await OBR.scene.items.updateItems([broken.id, ...carts.map((cart) => cart.id)], (items) => {
       for (const item of items) {
-        if (item.id === broken.id) {
-          item.visible = true;
-          item.position.x = brokenFinal.x;
-          item.position.y = brokenFinal.y;
-          item.rotation = brokenFinal.rotation;
-          continue;
-        }
-        const final = finals.get(item.id);
-        if (!final) continue;
-        item.position.x = final.x;
-        item.position.y = final.y;
-        item.rotation = final.rotation;
+        const profile = profiles.get(item.id);
+        if (!profile) continue;
+        item.visible = true;
+        item.position.x = profile.startX + profile.horizontalDrift;
+        item.position.y =
+          profile.startY +
+          profile.direction * (profile.sideKick + profile.fallDistance);
+        item.rotation = profile.startRotation + profile.spinDegrees;
+        item.scale.x = profile.startScaleX * profile.endScaleFactor;
+        item.scale.y = profile.startScaleY * profile.endScaleFactor;
       }
     });
 
@@ -1575,7 +1640,7 @@ OBR.onReady(async () => {
     await closeCrashWarningPopover();
     await OBR.popover.open({
       id: CRASH_POPOVER_ID,
-      url: `${window.location.pathname}?crashWarning=1&v=0.5.3`,
+      url: `${window.location.pathname}?crashWarning=1&v=0.5.4`,
       width: 64,
       height: 64,
       anchorReference: "POSITION",
@@ -1619,6 +1684,8 @@ OBR.onReady(async () => {
         y: broken.position.y,
         rotation: broken.rotation,
         visible: broken.visible,
+        scaleX: broken.scale.x,
+        scaleY: broken.scale.y,
       },
       cartHomes: carts.map((cart) => ({
         id: cart.id,
@@ -1626,6 +1693,8 @@ OBR.onReady(async () => {
         y: cart.position.y,
         rotation: cart.rotation,
         visible: cart.visible,
+        scaleX: cart.scale.x,
+        scaleY: cart.scale.y,
       })),
       crashedHomes: [],
       crashedTrack: null,
@@ -1651,6 +1720,8 @@ OBR.onReady(async () => {
         item.position.x = home.x;
         item.position.y = home.y;
         item.rotation = home.rotation;
+        item.scale.x = home.scaleX;
+        item.scale.y = home.scaleY;
         item.visible = home.visible;
       }
     });
@@ -1686,6 +1757,8 @@ OBR.onReady(async () => {
           item.position.x = crash.brokenHome.x;
           item.position.y = crash.brokenHome.y;
           item.rotation = crash.brokenHome.rotation;
+          item.scale.x = crash.brokenHome.scaleX;
+          item.scale.y = crash.brokenHome.scaleY;
           item.visible = runState === "running" ? false : crash.brokenHome.visible;
           continue;
         }
@@ -1694,6 +1767,8 @@ OBR.onReady(async () => {
         item.position.x = home.x;
         item.position.y = trackY;
         item.rotation = home.rotation;
+        item.scale.x = home.scaleX;
+        item.scale.y = home.scaleY;
         item.visible = home.visible;
       }
     });
