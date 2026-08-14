@@ -227,6 +227,8 @@ type CrashRuntimeState = {
   status: "armed" | "running" | "complete";
   brokenHome: CrashHome;
   cartHomes: CrashHome[];
+  crashedHomes: CrashHome[];
+  crashedTrack: 1 | 2 | null;
 };
 
 function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
@@ -258,27 +260,36 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
     return null;
   }
 
-  const cartHomes: CrashHome[] = [];
-  for (const rawHome of value.cartHomes) {
-    if (!rawHome || typeof rawHome !== "object") continue;
-    const home = rawHome as Partial<CrashHome>;
-    if (
-      typeof home.id !== "string" ||
-      !Number.isFinite(home.x) ||
-      !Number.isFinite(home.y) ||
-      !Number.isFinite(home.rotation) ||
-      typeof home.visible !== "boolean"
-    ) {
-      continue;
+  const parseHomes = (rawHomes: unknown): CrashHome[] => {
+    if (!Array.isArray(rawHomes)) return [];
+    const homes: CrashHome[] = [];
+    for (const rawHome of rawHomes) {
+      if (!rawHome || typeof rawHome !== "object") continue;
+      const home = rawHome as Partial<CrashHome>;
+      if (
+        typeof home.id !== "string" ||
+        !Number.isFinite(home.x) ||
+        !Number.isFinite(home.y) ||
+        !Number.isFinite(home.rotation) ||
+        typeof home.visible !== "boolean"
+      ) {
+        continue;
+      }
+      homes.push({
+        id: home.id,
+        x: Number(home.x),
+        y: Number(home.y),
+        rotation: Number(home.rotation),
+        visible: home.visible,
+      });
     }
-    cartHomes.push({
-      id: home.id,
-      x: Number(home.x),
-      y: Number(home.y),
-      rotation: Number(home.rotation),
-      visible: home.visible,
-    });
-  }
+    return homes;
+  };
+
+  const cartHomes = parseHomes(value.cartHomes);
+  const crashedHomes = parseHomes((value as Partial<CrashRuntimeState>).crashedHomes);
+  const crashedTrack =
+    value.crashedTrack === 1 || value.crashedTrack === 2 ? value.crashedTrack : null;
 
   return {
     version: 2,
@@ -296,6 +307,8 @@ function parseCrashRuntime(raw: unknown): CrashRuntimeState | null {
       visible: broken.visible,
     },
     cartHomes,
+    crashedHomes,
+    crashedTrack,
   };
 }
 
@@ -336,7 +349,12 @@ function crashTrackForY(y: number, track1Y: number, track2Y: number): 1 | 2 {
   return Math.abs(y - track1Y) <= Math.abs(y - track2Y) ? 1 : 2;
 }
 
-async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<void> {
+type CrashExecutionResult = {
+  crashedHomes: CrashHome[];
+  targetTrack: 1 | 2;
+};
+
+async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<CrashExecutionResult> {
   const shared = await OBR.scene.items.getItems([state.brokenCartId, ...state.minecartIds]);
   const byId = new Map(shared.filter(isImage).map((image) => [image.id, image] as const));
   const broken = byId.get(state.brokenCartId);
@@ -354,6 +372,14 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<void> {
   if (carts.length === 0) {
     throw new Error(`No player minecarts are currently on Track ${targetTrack}.`);
   }
+
+  const crashedHomes: CrashHome[] = carts.map((cart) => ({
+    id: cart.id,
+    x: cart.position.x,
+    y: targetY,
+    rotation: cart.rotation,
+    visible: cart.visible,
+  }));
 
   const sortedCarts = [...carts].sort((a, b) => b.position.x - a.position.x);
   const frontCart = sortedCarts[0];
@@ -475,6 +501,8 @@ async function executeBrokenCartCrash(state: CrashRuntimeState): Promise<void> {
         item.rotation = final.rotation;
       }
     });
+
+    return { crashedHomes, targetTrack };
   } catch (error) {
     try {
       stop();
@@ -531,15 +559,25 @@ async function runCrashWarningPopover(): Promise<void> {
 
       try {
         await waitMs(450);
-        await executeBrokenCartCrash({ ...state, status: "running" });
-        await writeCrashRuntime({ ...state, status: "complete" });
+        const result = await executeBrokenCartCrash({ ...state, status: "running" });
+        await writeCrashRuntime({
+          ...state,
+          status: "complete",
+          crashedHomes: result.crashedHomes,
+          crashedTrack: result.targetTrack,
+        });
         button.classList.remove("firing");
         button.textContent = "💥";
         await waitMs(700);
         await OBR.popover.close(CRASH_POPOVER_ID);
       } catch (error) {
         console.error("Minecart Scroll crash event failed:", error);
-        await writeCrashRuntime({ ...state, status: "armed" });
+        await writeCrashRuntime({
+          ...state,
+          status: "armed",
+          crashedHomes: [],
+          crashedTrack: null,
+        });
         button.classList.remove("firing");
         button.textContent = "⚠";
         button.disabled = false;
@@ -931,9 +969,15 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <span id="crashTrack1Status">Not set</span><br><br>
         <button id="setCrashTrack2Button">Set Track 2 Position</button>
         <span id="crashTrack2Status">Not set</span>
-        <p style="font-size:12px; margin-bottom:0;">
+        <p style="font-size:12px;">
           Select one cart or image centered on each rail, then set its track position.
           When ⚠ is clicked, only minecarts currently closest to the broken cart's rail will crash.
+        </p>
+        <button id="resetCrashedMinecartsButton">Reset Last Crash</button>
+        <span id="resetCrashStatus">No crash to reset</span>
+        <p style="font-size:12px; margin-bottom:0;">
+          Restores only the carts hit by the last crash to their pre-impact X positions,
+          centers them back on their crash rail, resets their rotation, and re-arms the broken cart for testing.
         </p>
       </fieldset>
 
@@ -1067,6 +1111,7 @@ OBR.onReady(async () => {
   const brokenCartStatus = document.querySelector<HTMLSpanElement>("#brokenCartStatus")!;
   const crashTrack1Status = document.querySelector<HTMLSpanElement>("#crashTrack1Status")!;
   const crashTrack2Status = document.querySelector<HTMLSpanElement>("#crashTrack2Status")!;
+  const resetCrashStatus = document.querySelector<HTMLSpanElement>("#resetCrashStatus")!;
   const setFloorButton = document.querySelector<HTMLButtonElement>("#setFloorButton")!;
   const setTrackButton = document.querySelector<HTMLButtonElement>("#setTrackButton")!;
   const setBackgroundButton = document.querySelector<HTMLButtonElement>("#setBackgroundButton")!;
@@ -1075,6 +1120,8 @@ OBR.onReady(async () => {
   const setBrokenCartButton = document.querySelector<HTMLButtonElement>("#setBrokenCartButton")!;
   const setCrashTrack1Button = document.querySelector<HTMLButtonElement>("#setCrashTrack1Button")!;
   const setCrashTrack2Button = document.querySelector<HTMLButtonElement>("#setCrashTrack2Button")!;
+  const resetCrashedMinecartsButton =
+    document.querySelector<HTMLButtonElement>("#resetCrashedMinecartsButton")!;
   const saveButton = document.querySelector<HTMLButtonElement>("#saveButton")!;
   const loadButton = document.querySelector<HTMLButtonElement>("#loadButton")!;
   const anchorXInput = document.querySelector<HTMLInputElement>("#anchorXInput")!;
@@ -1515,7 +1562,7 @@ OBR.onReady(async () => {
     await closeCrashWarningPopover();
     await OBR.popover.open({
       id: CRASH_POPOVER_ID,
-      url: `${window.location.pathname}?crashWarning=1&v=0.5.1`,
+      url: `${window.location.pathname}?crashWarning=1&v=0.5.2`,
       width: 64,
       height: 64,
       anchorReference: "POSITION",
@@ -1567,6 +1614,8 @@ OBR.onReady(async () => {
         rotation: cart.rotation,
         visible: cart.visible,
       })),
+      crashedHomes: [],
+      crashedTrack: null,
     };
     await OBR.scene.items.updateItems([broken.id], (items) => {
       for (const item of items) item.visible = false;
@@ -1592,8 +1641,75 @@ OBR.onReady(async () => {
         item.visible = home.visible;
       }
     });
-    await writeCrashRuntime({ ...crash, status: "complete" });
+    await writeCrashRuntime({
+      ...crash,
+      status: "complete",
+      crashedHomes: [],
+      crashedTrack: null,
+    });
   }
+
+  async function resetLastCrash(): Promise<void> {
+    const crash = await readCrashRuntime();
+    if (!crash || crash.crashedHomes.length === 0 || crash.crashedTrack === null) {
+      resetCrashStatus.textContent = "No crashed carts to reset.";
+      return;
+    }
+    if (crash.status === "running") {
+      resetCrashStatus.textContent = "Crash is still running.";
+      return;
+    }
+
+    await closeCrashWarningPopover();
+
+    const trackY = crash.crashedTrack === 1 ? crash.track1Y : crash.track2Y;
+    const resetHomes = crash.crashedHomes.map((home) => ({ ...home, y: trackY }));
+    const resetIds = [...resetHomes.map((home) => home.id), crash.brokenHome.id];
+
+    await OBR.scene.items.updateItems(resetIds, (items) => {
+      const homesById = new Map(resetHomes.map((home) => [home.id, home] as const));
+      for (const item of items) {
+        if (item.id === crash.brokenHome.id) {
+          item.position.x = crash.brokenHome.x;
+          item.position.y = crash.brokenHome.y;
+          item.rotation = crash.brokenHome.rotation;
+          item.visible = runState === "running" ? false : crash.brokenHome.visible;
+          continue;
+        }
+        const home = homesById.get(item.id);
+        if (!home) continue;
+        item.position.x = home.x;
+        item.position.y = trackY;
+        item.rotation = home.rotation;
+        item.visible = home.visible;
+      }
+    });
+
+    const nextStatus: CrashRuntimeState["status"] = runState === "running" ? "armed" : "complete";
+    await writeCrashRuntime({
+      ...crash,
+      status: nextStatus,
+      crashedHomes: [],
+      crashedTrack: null,
+    });
+
+    if (runState === "running") {
+      await openCrashWarningPopover();
+      resetCrashStatus.textContent =
+        `Reset ${resetHomes.length} cart${resetHomes.length === 1 ? "" : "s"} to Track ${crash.crashedTrack}. Hazard re-armed.`;
+    } else {
+      resetCrashStatus.textContent =
+        `Reset ${resetHomes.length} cart${resetHomes.length === 1 ? "" : "s"} to Track ${crash.crashedTrack}.`;
+    }
+  }
+
+  resetCrashedMinecartsButton.addEventListener("click", () => {
+    void resetLastCrash().catch((error) => {
+      console.error("Could not reset the last crash:", error);
+      resetCrashStatus.textContent =
+        error instanceof Error ? error.message : "Could not reset the last crash.";
+    });
+  });
 
   function makeSavedSettings(): SavedSettings {
     readControls();
